@@ -46,11 +46,19 @@ class IsimSehirApp extends StatelessWidget {
 }
 
 class LanGameClient extends ChangeNotifier {
+  LanGameClient({String? identity, this.discoveryEnabled = true, this.connectionTimeout = const Duration(seconds: 8), this.serverPort = port}) : _identityOverride = identity;
+  final String? _identityOverride;
+  final bool discoveryEnabled;
+  final Duration connectionTimeout;
+  final int serverPort;
+  int get roomPort => _server?.port ?? serverPort;
   HttpServer? _server;
   BonsoirBroadcast? _broadcast;
   BonsoirDiscovery? _discovery;
   StreamSubscription? _discoveryEvents;
   WebSocket? _socket;
+  StreamSubscription<dynamic>? _socketEvents;
+  int _connectionAttempt = 0;
   Timer? _clock;
   Timer? _deadline;
   final Map<String, String> discovered = {};
@@ -71,6 +79,7 @@ class LanGameClient extends ChangeNotifier {
   }
 
   Future<String> _identity() async {
+    if (_identityOverride != null) return _identityOverride;
     final prefs = await SharedPreferences.getInstance();
     final existing = prefs.getString('player_id');
     if (existing != null) return existing;
@@ -80,19 +89,23 @@ class LanGameClient extends ChangeNotifier {
   }
 
   Future<void> startHost(String name) async {
+    if (connecting || hosting) return;
+    connecting = true;
     error = null;
     playerName = name.trim();
     playerId = await _identity();
     try {
-      _server = await HttpServer.bind(InternetAddress.anyIPv4, port, shared: true);
+      _server = await HttpServer.bind(InternetAddress.anyIPv4, serverPort);
       _server!.listen(_accept, onError: (_) {});
       hosting = true;
       _startRoom();
       localIp = await _findLanIp();
-      final roomName = 'İsim Şehir ${state['room']}';
-      _broadcast = BonsoirBroadcast(service: BonsoirService(name: roomName, type: serviceType, port: port));
-      await _broadcast!.initialize();
-      await _broadcast!.start();
+      if (discoveryEnabled) {
+        final roomName = 'İsim Şehir ${state['room']}';
+        _broadcast = BonsoirBroadcast(service: BonsoirService(name: roomName, type: serviceType, port: roomPort));
+        await _broadcast!.initialize();
+        await _broadcast!.start();
+      }
       await _connect('127.0.0.1', name);
     } catch (e) {
       error = 'Oda açılamadı: $e';
@@ -140,29 +153,68 @@ class LanGameClient extends ChangeNotifier {
   }
 
   Future<void> join(String host, String name) async {
+    if (connecting) return;
+    connecting = true;
+    error = null;
+    notifyListeners();
     playerName = name.trim();
     playerId = await _identity();
     await _connect(host.trim(), name);
   }
 
   Future<void> _connect(String host, String name) async {
+    final attempt = ++_connectionAttempt;
     connecting = true;
     error = null;
     notifyListeners();
+    final previous = _socket;
+    _socket = null;
+    await _socketEvents?.cancel();
+    _socketEvents = null;
+    unawaited(previous?.close());
+    final acknowledged = Completer<void>();
     try {
-      _socket = await WebSocket.connect('ws://$host:$port', compression: CompressionOptions.compressionOff);
-      _socket!.listen(_onMessage, onDone: _disconnected, onError: (_) => _disconnected());
-      _socket!.add(jsonEncode({'type': 'join', 'id': playerId, 'name': name.trim()}));
-    } catch (_) {
+      final pending = WebSocket.connect(Uri(scheme: 'ws', host: host, port: roomPort).toString(), compression: CompressionOptions.compressionOff);
+      final socket = await pending.timeout(connectionTimeout, onTimeout: () {
+        unawaited(pending.then<void>((late) { unawaited(late.close()); }, onError: (Object error) {}));
+        throw TimeoutException('Connection timed out');
+      });
+      if (attempt != _connectionAttempt) {
+        await socket.close();
+        return;
+      }
+      _socket = socket;
+      socket.pingInterval = const Duration(seconds: 10);
+      void disconnected() {
+        if (!identical(_socket, socket)) return;
+        _disconnected();
+        if (!acknowledged.isCompleted) acknowledged.complete();
+      }
+      _socketEvents = socket.listen((raw) {
+        if (!identical(_socket, socket)) return;
+        _onMessage(raw);
+        if (!connecting && !acknowledged.isCompleted) acknowledged.complete();
+      }, onDone: disconnected, onError: (_) => disconnected());
+      socket.add(jsonEncode({'type': 'join', 'id': playerId, 'name': name.trim()}));
+      await acknowledged.future.timeout(connectionTimeout);
+    } catch (e) {
+      if (attempt != _connectionAttempt) return;
+      final failed = _socket;
+      _socket = null;
+      await _socketEvents?.cancel();
+      _socketEvents = null;
+      unawaited(failed?.close());
       connecting = false;
-      error = 'Odaya bağlanılamadı. Aynı Wi-Fi veya hotspot üzerinde olduğunuzu kontrol edin.';
+      error = e is TimeoutException
+          ? 'Oda yanıt vermedi. Oda sahibinin IP adresini kontrol edip yeniden deneyin. Hotspot kullanıyorsanız bağlı cihaz sınırını kontrol edin.'
+          : 'Odaya bağlanılamadı. Aynı Wi-Fi veya hotspot üzerinde olduğunuzu kontrol edin.';
       notifyListeners();
     }
   }
 
   void _accept(HttpRequest request) {
     if (WebSocketTransformer.isUpgradeRequest(request)) {
-      WebSocketTransformer.upgrade(request).then(_serveClient);
+      WebSocketTransformer.upgrade(request).then(_serveClient, onError: (_) {});
     } else {
       request.response.statusCode = HttpStatus.notFound;
       request.response.close();
@@ -170,6 +222,7 @@ class LanGameClient extends ChangeNotifier {
   }
 
   final Map<String, WebSocket> _clients = {};
+  final Map<String, Timer> _disconnectTimers = {};
   final Map<String, Map<String, bool>> _ballots = {};
   String? _hostId;
 
@@ -179,7 +232,11 @@ class LanGameClient extends ChangeNotifier {
       try {
         final message = jsonDecode(raw as String) as Map<String, dynamic>;
         if (message['type'] == 'join') {
-          final playerId = (message['id'] as String?) ?? const Uuid().v4();
+          if (id != null) return;
+          var playerId = (message['id'] as String?) ?? const Uuid().v4();
+          if (_clients[playerId]?.readyState == WebSocket.open) {
+            playerId = const Uuid().v4();
+          }
           id = playerId;
           final players = Map<String, dynamic>.from(state['players'] as Map);
           if (!players.containsKey(playerId)) {
@@ -197,14 +254,17 @@ class LanGameClient extends ChangeNotifier {
           final previous = Map<String, dynamic>.from(players[playerId] as Map? ?? {});
           players[playerId] = {...previous, 'id': playerId, 'name': _cleanName(message['name'] as String? ?? 'Oyuncu'), 'connected': true, 'answers': previous['answers'] ?? <String, String>{}, 'score': previous['score'] ?? 0};
           state['players'] = players;
+          _disconnectTimers.remove(playerId)?.cancel();
           _clients[playerId] = socket;
           _hostId ??= playerId;
-          _sendState(socket);
+          socket.pingInterval = const Duration(seconds: 10);
+          socket.add(jsonEncode({'type': 'welcome', 'id': playerId}));
+          _sendState(socket, playerId);
           if (phase == 'answer' && (players.values).where((p) => (p as Map)['connected'] == true).every((p) => (p as Map)['submitted'] == true)) _beginReview();
           _broadcastState();
           return;
         }
-        if (id == null || !_clients.containsKey(id)) return;
+        if (id == null || !identical(_clients[id], socket)) return;
         _handleAction(id!, message);
       } catch (_) {
         socket.add(jsonEncode({'type': 'error', 'message': 'Geçersiz oyun verisi.'}));
@@ -218,7 +278,9 @@ class LanGameClient extends ChangeNotifier {
     final players = Map<String, dynamic>.from(state['players'] as Map);
     if (players[id] is Map) players[id] = {...Map<String, dynamic>.from(players[id] as Map), 'connected': false};
     state['players'] = players;
-    Timer(const Duration(seconds: 45), () {
+    _disconnectTimers.remove(id)?.cancel();
+    _disconnectTimers[id] = Timer(const Duration(seconds: 45), () {
+      _disconnectTimers.remove(id);
       if (_clients.containsKey(id)) return;
       final current = Map<String, dynamic>.from(state['players'] as Map);
       if (current[id] is Map && current[id]['connected'] != true) {
@@ -394,10 +456,18 @@ class LanGameClient extends ChangeNotifier {
   void _onMessage(dynamic raw) {
     try {
       final message = jsonDecode(raw as String) as Map<String, dynamic>;
-      if (message['type'] == 'state') {
-        _serverOffsetMs = ((message['serverNow'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch) - DateTime.now().millisecondsSinceEpoch;
-        state = Map<String, dynamic>.from(message['state'] as Map);
-        state['votes'] = message['votes'] ?? {};
+      if (message['type'] == 'welcome') {
+        playerId = message['id'] as String;
+        if (_identityOverride == null) {
+          final assignedId = playerId!;
+          unawaited(SharedPreferences.getInstance().then<void>((prefs) { unawaited(prefs.setString('player_id', assignedId)); }));
+        }
+      } else if (message['type'] == 'state') {
+        _serverOffsetMs = hosting ? 0 : ((message['serverNow'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch) - DateTime.now().millisecondsSinceEpoch;
+        // The host's loopback socket can receive snapshots queued before another
+        // player joined. Keep the authoritative room instead of restoring them.
+        if (!hosting) state = Map<String, dynamic>.from(message['state'] as Map);
+        state['votes'] = hosting ? _voteSummary(playerId) : message['votes'] ?? {};
         connecting = false;
         error = null;
         _clock?.cancel();
@@ -406,6 +476,7 @@ class LanGameClient extends ChangeNotifier {
         }
       } else if (message['type'] == 'error') {
         error = message['message'] as String?;
+        connecting = false;
       }
       notifyListeners();
     } catch (_) {}
@@ -415,7 +486,7 @@ class LanGameClient extends ChangeNotifier {
     if (_socket != null) {
       _socket = null;
       connecting = false;
-      if (!hosting) error = 'Bağlantı kesildi. Odaya yeniden katılmayı deneyin.';
+      if (!hosting) error ??= 'Bağlantı kesildi. Odaya yeniden katılmayı deneyin.';
       notifyListeners();
     }
   }
@@ -427,17 +498,24 @@ class LanGameClient extends ChangeNotifier {
   void _send(Map<String, dynamic> message) { if (_socket?.readyState == WebSocket.open) _socket!.add(jsonEncode(message)); }
 
   Future<void> close() async {
+    _connectionAttempt++;
+    connecting = false;
     _clock?.cancel();
     _deadline?.cancel();
     await stopDiscovery();
     try { await _broadcast?.stop(); } catch (_) {}
     _broadcast = null;
+    await _socketEvents?.cancel();
+    _socketEvents = null;
     await _socket?.close();
     _socket = null;
     await _server?.close(force: true);
     _server = null;
-    for (final socket in _clients.values) { try { await socket.close(); } catch (_) {} }
+    final clients = _clients.values.toList();
     _clients.clear();
+    for (final timer in _disconnectTimers.values) { timer.cancel(); }
+    _disconnectTimers.clear();
+    for (final socket in clients) { try { await socket.close(); } catch (_) {} }
     _hostId = null;
     _ballots.clear();
     hosting = false;
@@ -482,7 +560,7 @@ class _GameHomeState extends State<GameHome> {
 
   @override
   void initState() { super.initState(); game.addListener(_update); }
-  void _update() { if (!mounted) return; if (!_entered && game.state.isNotEmpty && game.playerId != null && game.error == null) { _entered = true; game.stopDiscovery(); Navigator.of(context).push(MaterialPageRoute(builder: (_) => GameRoomScreen(game: game, onExit: () { _entered = false; if (mounted) setState(() {}); }))); } setState(() {}); }
+  void _update() { if (!mounted) return; if (!_entered && !game.connecting && (game.state['players'] as Map?)?.containsKey(game.playerId) == true && game.error == null) { _entered = true; game.stopDiscovery(); Navigator.of(context).push(MaterialPageRoute(builder: (_) => GameRoomScreen(game: game, onExit: () { _entered = false; if (mounted) setState(() {}); }))); } setState(() {}); }
   String get _name => name.text.trim().isEmpty ? 'Oyuncu' : name.text.trim();
   @override
   void dispose() { game.removeListener(_update); name.dispose(); ip.dispose(); game.close(); super.dispose(); }
@@ -525,7 +603,7 @@ class _GameHomeState extends State<GameHome> {
                                 await game.startDiscovery();
                                 Future.delayed(const Duration(seconds: 7), () { if (mounted) setState(() => scanning = false); });
                               }, secondary: 'Aynı Wi-Fi veya telefon hotspotu'),
-                              if (game.discovered.isNotEmpty) ...game.discovered.entries.map((e) => Padding(padding: const EdgeInsets.only(top: 9), child: _button(e.key, Icons.wifi_rounded, gold, () => game.join(e.value, _name), secondary: e.value))),
+                              if (game.discovered.isNotEmpty) ...game.discovered.entries.map((e) => Padding(padding: const EdgeInsets.only(top: 9), child: _button(e.key, Icons.wifi_rounded, gold, game.connecting ? null : () => game.join(e.value, _name), secondary: e.value))),
                               const SizedBox(height: 16),
                               Row(children: [Expanded(child: TextField(controller: ip, keyboardType: TextInputType.url, decoration: const InputDecoration(hintText: 'Oda IP adresi', prefixIcon: Icon(Icons.lan_outlined)))), const SizedBox(width: 8), IconButton.filled(onPressed: game.connecting ? null : () => game.join(ip.text, _name), icon: const Icon(Icons.arrow_forward_rounded), style: IconButton.styleFrom(backgroundColor: gold, foregroundColor: ink, minimumSize: const Size(54, 54)))]),
                               const SizedBox(height: 7),

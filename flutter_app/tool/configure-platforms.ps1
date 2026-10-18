@@ -17,6 +17,6 @@ foreach ($permission in $permissions) {
   }
 }
 if ($xml -notmatch 'usesCleartextTraffic') {
-  $xml = $xml.Replace('<application ', '<application android:usesCleartextTraffic="true" ')
+  $xml = [regex]::Replace($xml, '<application\b', '<application android:usesCleartextTraffic="true"')
 }
 [System.IO.File]::WriteAllText($manifest, $xml, [System.Text.UTF8Encoding]::new($false))

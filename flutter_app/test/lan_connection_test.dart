@@ -104,6 +104,101 @@ void main() {
     expect(playerIds(host), {'host', 'guest'});
   });
 
+  test('join tries another room address when the first address is unreachable',
+      () async {
+    final host = LanGameClient(
+      identity: 'host',
+      discoveryEnabled: false,
+      serverPort: 0,
+    );
+    final guest = LanGameClient(
+      identity: 'guest',
+      discoveryEnabled: false,
+      connectionTimeout: const Duration(milliseconds: 100),
+    );
+    addTearDown(() async {
+      await guest.close();
+      await host.close();
+    });
+    await host.startHost('Oda sahibi');
+
+    await guest.join(
+      '203.0.113.1',
+      'Misafir',
+      alternatives: ['127.0.0.1'],
+      remotePort: host.roomPort,
+    ).timeout(const Duration(seconds: 3));
+
+    expect(guest.connecting, isFalse);
+    expect(guest.error, isNull);
+    expect(playerIds(guest), {'host', 'guest'});
+    expect(playerIds(host), {'host', 'guest'});
+  });
+
+  test('manual IP and port override the default room port', () async {
+    final host = LanGameClient(
+      identity: 'host',
+      discoveryEnabled: false,
+      serverPort: 0,
+    );
+    final guest = LanGameClient(
+      identity: 'guest',
+      discoveryEnabled: false,
+    );
+    addTearDown(() async {
+      await guest.close();
+      await host.close();
+    });
+    await host.startHost('Oda sahibi');
+
+    await guest.join('127.0.0.1:${host.roomPort}', 'Misafir');
+
+    expect(guest.error, isNull);
+    expect(guest.connecting, isFalse);
+    expect(playerIds(guest), {'host', 'guest'});
+  });
+
+  test('host duration is shared and guest cannot override it', () async {
+    final host = LanGameClient(
+      identity: 'host',
+      discoveryEnabled: false,
+      serverPort: 0,
+    );
+    final clients = <LanGameClient>[host];
+    addTearDown(() async {
+      for (final client in clients.reversed) {
+        await client.close();
+      }
+    });
+    await host.startHost('Oda sahibi');
+    final guest = LanGameClient(
+      identity: 'guest',
+      discoveryEnabled: false,
+      serverPort: host.roomPort,
+    );
+    clients.add(guest);
+    await guest.join('127.0.0.1', 'Misafir');
+
+    host.setRoundDuration(180);
+    await waitUntil(() => guest.state['duration'] == 180);
+    expect(host.state['duration'], 180);
+    guest.setRoundDuration(30);
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    expect(host.state['duration'], 180);
+    expect(guest.state['duration'], 180);
+
+    final startedAt = DateTime.now().millisecondsSinceEpoch;
+    host.startRound();
+    await waitUntil(() => host.phase == 'answer' && guest.phase == 'answer');
+    expect(host.state['duration'], 180);
+    expect(guest.state['duration'], 180);
+    expect(guest.state['endsAt'], host.state['endsAt']);
+    expect(
+      host.state['endsAt'] as int,
+      inInclusiveRange(startedAt + 179000, startedAt + 183000),
+    );
+  });
+
   test('a socket without a join reply times out instead of hanging', () async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final sockets = <WebSocket>[];

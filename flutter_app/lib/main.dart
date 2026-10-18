@@ -62,6 +62,9 @@ class LanGameClient extends ChangeNotifier {
   Timer? _clock;
   Timer? _deadline;
   final Map<String, String> discovered = {};
+  final Map<String, List<String>> _roomAddresses = {};
+  final Map<String, int> _roomPorts = {};
+  List<String> localAddresses = [];
   Map<String, dynamic> state = {};
   String? playerId;
   String playerName = '';
@@ -93,25 +96,42 @@ class LanGameClient extends ChangeNotifier {
     connecting = true;
     error = null;
     playerName = name.trim();
-    playerId = await _identity();
     try {
+      playerId = await _identity();
       _server = await HttpServer.bind(InternetAddress.anyIPv4, serverPort);
       _server!.listen(_accept, onError: (_) {});
       hosting = true;
       _startRoom();
-      localIp = await _findLanIp();
-      if (discoveryEnabled) {
-        final roomName = 'İsim Şehir ${state['room']}';
-        _broadcast = BonsoirBroadcast(service: BonsoirService(name: roomName, type: serviceType, port: roomPort));
-        await _broadcast!.initialize();
-        await _broadcast!.start();
-      }
-      await _connect('127.0.0.1', name);
+      _hostId = playerId;
+      state['players'] = {playerId!: {'id': playerId, 'name': _cleanName(name), 'connected': true, 'answers': <String, String>{}, 'score': 0}};
+      localAddresses = await _findLanAddresses();
+      localIp = localAddresses.isEmpty ? null : localAddresses.first;
+      state['hostAddresses'] = localAddresses;
+      state['hostPort'] = roomPort;
+      connecting = false;
+      if (discoveryEnabled) unawaited(_publishRoom());
     } catch (e) {
       error = 'Oda açılamadı: $e';
       await close();
     }
     notifyListeners();
+  }
+
+  Future<void> _publishRoom() async {
+    final server = _server;
+    if (server == null) return;
+    final broadcast = BonsoirBroadcast(service: BonsoirService(
+      name: 'İsim Şehir ${state['room']}', type: serviceType, port: server.port,
+      attributes: {'ips': localAddresses.join(','), 'protocol': '2'},
+    ));
+    _broadcast = broadcast;
+    try {
+      await broadcast.initialize().timeout(const Duration(seconds: 4));
+      if (!identical(_server, server)) return;
+      await broadcast.start().timeout(const Duration(seconds: 4));
+    } catch (_) {
+      // Manual IP joining remains available when multicast is unavailable.
+    }
   }
 
   void _startRoom() {
@@ -125,23 +145,38 @@ class LanGameClient extends ChangeNotifier {
   Future<void> startDiscovery() async {
     await stopDiscovery();
     discovered.clear();
+    _roomAddresses.clear();
+    _roomPorts.clear();
     _discovery = BonsoirDiscovery(type: serviceType);
     await _discovery!.initialize();
     _discoveryEvents = _discovery!.eventStream!.listen((event) {
       if (event is BonsoirDiscoveryServiceFoundEvent) {
         event.service.resolve(_discovery!.serviceResolver);
       } else if (event is BonsoirDiscoveryServiceResolvedEvent) {
-        final service = event.service;
-        if (service.hostAddresses.isNotEmpty) {
-          discovered[service.name] = service.hostAddresses.firstWhere((address) => InternetAddress.tryParse(address)?.type == InternetAddressType.IPv4, orElse: () => service.hostAddresses.first);
-          notifyListeners();
-        }
+        _recordRoom(event.service);
+      } else if (event is BonsoirDiscoveryServiceUpdatedEvent) {
+        _recordRoom(event.service);
       } else if (event is BonsoirDiscoveryServiceLostEvent) {
         discovered.remove(event.service.name);
+        _roomAddresses.remove(event.service.name);
+        _roomPorts.remove(event.service.name);
         notifyListeners();
       }
     });
     await _discovery!.start();
+    notifyListeners();
+  }
+
+  void _recordRoom(BonsoirService service) {
+    final addresses = [...(service.attributes['ips'] ?? '').split(','), ...service.hostAddresses]
+        .where((value) {
+          final address = InternetAddress.tryParse(value);
+          return address != null && address.type == InternetAddressType.IPv4 && !address.isLoopback && address.address != '0.0.0.0';
+        }).toSet().toList();
+    if (addresses.isEmpty) return;
+    _roomAddresses[service.name] = addresses;
+    _roomPorts[service.name] = service.port;
+    discovered[service.name] = addresses.first;
     notifyListeners();
   }
 
@@ -152,17 +187,30 @@ class LanGameClient extends ChangeNotifier {
     _discoveryEvents = null;
   }
 
-  Future<void> join(String host, String name) async {
+  Future<void> joinRoom(String room, String name) => join(discovered[room] ?? '', name,
+    alternatives: _roomAddresses[room] ?? [], remotePort: _roomPorts[room]);
+
+  Future<void> join(String host, String name, {List<String> alternatives = const [], int? remotePort}) async {
     if (connecting) return;
     connecting = true;
     error = null;
     notifyListeners();
     playerName = name.trim();
-    playerId = await _identity();
-    await _connect(host.trim(), name);
+    try {
+      playerId = await _identity();
+      final value = host.trim();
+      final uri = Uri.parse(value.contains('://') ? value : 'ws://$value');
+      if (uri.host.isEmpty) throw const FormatException('Missing host');
+      await _connect(uri.host, name, alternatives: alternatives,
+        remotePort: remotePort ?? (uri.hasPort ? uri.port : serverPort));
+    } catch (_) {
+      connecting = false;
+      error = 'Geçerli bir oda IP adresi yazın (örnek: 192.168.43.1 veya 192.168.43.1:4040).';
+      notifyListeners();
+    }
   }
 
-  Future<void> _connect(String host, String name) async {
+  Future<void> _connect(String host, String name, {List<String> alternatives = const [], int? remotePort}) async {
     final attempt = ++_connectionAttempt;
     connecting = true;
     error = null;
@@ -172,44 +220,50 @@ class LanGameClient extends ChangeNotifier {
     await _socketEvents?.cancel();
     _socketEvents = null;
     unawaited(previous?.close());
-    final acknowledged = Completer<void>();
-    try {
-      final pending = WebSocket.connect(Uri(scheme: 'ws', host: host, port: roomPort).toString(), compression: CompressionOptions.compressionOff);
-      final socket = await pending.timeout(connectionTimeout, onTimeout: () {
-        unawaited(pending.then<void>((late) { unawaited(late.close()); }, onError: (Object error) {}));
-        throw TimeoutException('Connection timed out');
-      });
-      if (attempt != _connectionAttempt) {
-        await socket.close();
+    final candidates = {host, ...alternatives}.where((value) => value.isNotEmpty).toList();
+    final addressTimeout = connectionTimeout < const Duration(seconds: 3) ? connectionTimeout : const Duration(seconds: 3);
+    for (final address in candidates) {
+      final acknowledged = Completer<void>();
+      try {
+        final client = HttpClient()..findProxy = (_) => 'DIRECT';
+        final pending = WebSocket.connect(Uri(scheme: 'ws', host: address, port: remotePort ?? serverPort).toString(),
+          customClient: client, compression: CompressionOptions.compressionOff).whenComplete(() => client.close());
+        final socket = await pending.timeout(addressTimeout, onTimeout: () {
+          client.close(force: true);
+          unawaited(pending.then<void>((late) { unawaited(late.close()); }, onError: (Object error) {}));
+          throw TimeoutException('Connection timed out');
+        });
+        if (attempt != _connectionAttempt) { unawaited(socket.close()); return; }
+        _socket = socket;
+        socket.pingInterval = const Duration(seconds: 10);
+        void disconnected() {
+          if (!identical(_socket, socket)) return;
+          if (!acknowledged.isCompleted) {
+            acknowledged.completeError(const SocketException('Room closed before joining'));
+          } else {
+            _disconnected();
+          }
+        }
+        _socketEvents = socket.listen((raw) {
+          if (!identical(_socket, socket)) return;
+          _onMessage(raw);
+          if (!connecting && !acknowledged.isCompleted) acknowledged.complete();
+        }, onDone: disconnected, onError: (_) => disconnected());
+        socket.add(jsonEncode({'type': 'join', 'id': playerId, 'name': name.trim()}));
+        await acknowledged.future.timeout(connectionTimeout);
         return;
+      } catch (_) {
+        if (attempt != _connectionAttempt) return;
+        final failed = _socket;
+        _socket = null;
+        await _socketEvents?.cancel();
+        _socketEvents = null;
+        unawaited(failed?.close());
       }
-      _socket = socket;
-      socket.pingInterval = const Duration(seconds: 10);
-      void disconnected() {
-        if (!identical(_socket, socket)) return;
-        _disconnected();
-        if (!acknowledged.isCompleted) acknowledged.complete();
-      }
-      _socketEvents = socket.listen((raw) {
-        if (!identical(_socket, socket)) return;
-        _onMessage(raw);
-        if (!connecting && !acknowledged.isCompleted) acknowledged.complete();
-      }, onDone: disconnected, onError: (_) => disconnected());
-      socket.add(jsonEncode({'type': 'join', 'id': playerId, 'name': name.trim()}));
-      await acknowledged.future.timeout(connectionTimeout);
-    } catch (e) {
-      if (attempt != _connectionAttempt) return;
-      final failed = _socket;
-      _socket = null;
-      await _socketEvents?.cancel();
-      _socketEvents = null;
-      unawaited(failed?.close());
-      connecting = false;
-      error = e is TimeoutException
-          ? 'Oda yanıt vermedi. Oda sahibinin IP adresini kontrol edip yeniden deneyin. Hotspot kullanıyorsanız bağlı cihaz sınırını kontrol edin.'
-          : 'Odaya bağlanılamadı. Aynı Wi-Fi veya hotspot üzerinde olduğunuzu kontrol edin.';
-      notifyListeners();
     }
+    connecting = false;
+    error = 'Odaya ulaşılamadı. Oda sahibinin ekranındaki Wi-Fi/hotspot IP adresini elle deneyin. Telefonlar aynı ağda olmalı; VPN ve hotspot cihaz yalıtımı bağlantıyı engelleyebilir.';
+    notifyListeners();
   }
 
   void _accept(HttpRequest request) {
@@ -278,6 +332,7 @@ class LanGameClient extends ChangeNotifier {
     final players = Map<String, dynamic>.from(state['players'] as Map);
     if (players[id] is Map) players[id] = {...Map<String, dynamic>.from(players[id] as Map), 'connected': false};
     state['players'] = players;
+    _tryFinishReview();
     _disconnectTimers.remove(id)?.cancel();
     _disconnectTimers[id] = Timer(const Duration(seconds: 45), () {
       _disconnectTimers.remove(id);
@@ -295,9 +350,14 @@ class LanGameClient extends ChangeNotifier {
 
   void _handleAction(String id, Map<String, dynamic> m) {
     switch (m['type']) {
+      case 'settings':
+        if (id != _hostId || phase != 'lobby') return;
+        state['duration'] = (m['duration'] as num?)?.toInt().clamp(30, 300).toInt() ?? 60;
+        _broadcastState();
+        return;
       case 'start':
         if (id != _hostId || phase != 'lobby' || _playerCount < 2) return;
-        final duration = (m['duration'] as num?)?.toInt().clamp(30, 120).toInt() ?? 60;
+        final duration = ((m['duration'] ?? state['duration']) as num?)?.toInt().clamp(30, 300).toInt() ?? 60;
         state['round'] = 1;
         state['totalRounds'] = 5;
         state['duration'] = duration;
@@ -311,7 +371,7 @@ class LanGameClient extends ChangeNotifier {
         final clean = <String, String>{};
         for (var i = 0; i < questions.length; i++) {
           final value = _cleanAnswer(raw['$i'] as String? ?? '');
-          if (value.isNotEmpty && startsWithRoundLetter(value, state['letter'] as String)) clean['$i'] = value;
+          if (value.isNotEmpty) clean['$i'] = value;
         }
         players[id] = {...Map<String, dynamic>.from(players[id] as Map), 'answers': clean, 'submitted': true};
         state['players'] = players;
@@ -321,9 +381,14 @@ class LanGameClient extends ChangeNotifier {
       case 'vote':
         if (phase != 'review') return;
         final target = m['target'] as String?;
-        if (target == null || target == id || (state['players'] as Map)[target] == null) return;
+        if (target == null || target == id || target != state['reviewTarget'] ||
+            m['step'] != state['reviewStep']) return;
+        final reviewPlayers = state['players'] as Map;
+        if (reviewPlayers[target] == null || (reviewPlayers[id] as Map?)?['connected'] != true) return;
         final index = (m['index'] as num?)?.toInt();
         if (index == null || index < 0 || index >= questions.length) return;
+        final answer = ((reviewPlayers[target] as Map)['answers'] as Map?)?['$index'];
+        if (answer is! String || answer.isEmpty) return;
         final key = '$target:$index';
         (_ballots[key] ??= {})[id] = m['valid'] == true;
         _tryFinishReview();
@@ -361,30 +426,54 @@ class LanGameClient extends ChangeNotifier {
   void _beginReview() {
     if (phase != 'answer') return;
     state['phase'] = 'review';
-    state['endsAt'] = DateTime.now().add(const Duration(seconds: 35)).millisecondsSinceEpoch;
-    _setDeadline(35, _finishReview);
-    _tryFinishReview();
-    _broadcastState();
+    state['reviewOrder'] = (state['players'] as Map).keys.cast<String>().toList();
+    state['reviewStep'] = -1;
+    state['reviewTarget'] = null;
+    _advanceReview();
+  }
+
+  void _advanceReview() {
+    if (phase != 'review') return;
+    _deadline?.cancel();
+    final order = List<String>.from(state['reviewOrder'] as List? ?? []);
+    final players = state['players'] as Map;
+    var step = (state['reviewStep'] as int? ?? -1) + 1;
+    while (step < order.length) {
+      final target = order[step];
+      final answers = (players[target] as Map?)?['answers'] as Map? ?? {};
+      if (answers.values.any((answer) => answer is String && answer.isNotEmpty)) {
+        state['reviewStep'] = step;
+        state['reviewTarget'] = target;
+        state['endsAt'] = DateTime.now().add(const Duration(seconds: 35)).millisecondsSinceEpoch;
+        _setDeadline(35, _advanceReview);
+        _tryFinishReview();
+        _broadcastState();
+        return;
+      }
+      step++;
+    }
+    state['reviewStep'] = order.length;
+    state['reviewTarget'] = null;
+    _finishReview();
   }
 
   void _tryFinishReview() {
     if (phase != 'review') return;
     final players = state['players'] as Map;
-    final connected = players.values.where((p) => (p as Map)['connected'] == true).length;
-    if (connected < 2) return;
-    var pending = false;
-    for (final entry in players.entries) {
-      final targetId = entry.key as String;
-      if ((entry.value as Map)['connected'] != true) continue;
-      for (var i = 0; i < questions.length; i++) {
-        final answer = ((entry.value as Map)['answers'] as Map?)?['$i'];
-        if (answer == null || (answer as String).isEmpty) continue;
-        final ballot = _ballots['$targetId:$i'] ?? {};
-        final eligible = players.entries.where((e) => e.key != targetId && (e.value as Map)['connected'] == true).length;
-        if (ballot.length < eligible) pending = true;
-      }
+    final targetId = state['reviewTarget'] as String?;
+    if (targetId == null) return;
+    final answers = (players[targetId] as Map?)?['answers'] as Map? ?? {};
+    final eligible = players.entries
+        .where((e) => e.key != targetId && (e.value as Map)['connected'] == true)
+        .map((e) => e.key as String)
+        .toList();
+    for (var i = 0; i < questions.length; i++) {
+      final answer = answers['$i'];
+      if (answer is! String || answer.isEmpty) continue;
+      final ballot = _ballots['$targetId:$i'] ?? {};
+      if (eligible.any((voter) => !ballot.containsKey(voter))) return;
     }
-    if (!pending) _finishReview();
+    _advanceReview();
   }
 
   void _finishReview() {
@@ -398,9 +487,9 @@ class LanGameClient extends ChangeNotifier {
         final answer = answers['$i'];
         if (answer == null || (answer as String).isEmpty) continue;
         final ballot = _ballots['$target:$i'] ?? {};
-        final eligible = players.entries.where((e) => e.key != target && (e.value as Map)['connected'] == true).length;
-        final yes = ballot.values.where((v) => v == true).length;
-        accepted['$target:$i'] = isAnswerAccepted(yesVotes: yes, eligibleVoters: eligible);
+        final eligible = players.entries.where((e) => e.key != target && (e.value as Map)['connected'] == true).map((e) => e.key).toList();
+        final yes = eligible.where((voter) => ballot[voter] == true).length;
+        accepted['$target:$i'] = startsWithRoundLetter(answer, state['letter'] as String) && isAnswerAccepted(yesVotes: yes, eligibleVoters: eligible.length);
       }
     }
     final answerCounts = <String, int>{};
@@ -433,6 +522,7 @@ class LanGameClient extends ChangeNotifier {
     state['roundResults'] = {'scores': roundScores, 'accepted': accepted};
     state['phase'] = 'results';
     state['endsAt'] = null;
+    _deadline?.cancel();
     _clock?.cancel();
     _broadcastState();
   }
@@ -448,6 +538,12 @@ class LanGameClient extends ChangeNotifier {
       if (socket.readyState == WebSocket.open) {
         try { _sendState(socket, _clients.entries.firstWhere((e) => identical(e.value, socket)).key); } catch (_) {}
       }
+    }
+    if (hosting) {
+      state['votes'] = _voteSummary(playerId);
+      _clock?.cancel();
+      if (state['endsAt'] != null) _clock = Timer.periodic(const Duration(milliseconds: 400), (_) => notifyListeners());
+      notifyListeners();
     }
   }
 
@@ -491,11 +587,15 @@ class LanGameClient extends ChangeNotifier {
     }
   }
 
-  void startRound([int duration = 60]) => _send({'type': 'start', 'duration': duration});
+  void setRoundDuration(int duration) => _send({'type': 'settings', 'duration': duration});
+  void startRound([int? duration]) => _send({'type': 'start', 'duration': duration ?? state['duration'] ?? 60});
   void submit(Map<int, String> answers) => _send({'type': 'answers', 'answers': {for (final e in answers.entries) '${e.key}': e.value}});
-  void vote(String target, int index, bool valid) => _send({'type': 'vote', 'target': target, 'index': index, 'valid': valid});
+  void vote(String target, int index, bool valid) => _send({'type': 'vote', 'target': target, 'index': index, 'valid': valid, 'step': state['reviewStep']});
   void next() => _send({'type': 'next'});
-  void _send(Map<String, dynamic> message) { if (_socket?.readyState == WebSocket.open) _socket!.add(jsonEncode(message)); }
+  void _send(Map<String, dynamic> message) {
+    if (hosting && playerId != null) { _handleAction(playerId!, message); return; }
+    if (_socket?.readyState == WebSocket.open) _socket!.add(jsonEncode(message));
+  }
 
   Future<void> close() async {
     _connectionAttempt++;
@@ -523,11 +623,22 @@ class LanGameClient extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<String?> _findLanIp() async {
+  Future<List<String>> _findLanAddresses() async {
     final interfaces = await NetworkInterface.list(type: InternetAddressType.IPv4, includeLoopback: false);
-    final addresses = interfaces.expand((interface) => interface.addresses).where((address) => !address.isLoopback).toList();
-    addresses.sort((a, b) => (_isPrivateIpv4(b) ? 1 : 0).compareTo(_isPrivateIpv4(a) ? 1 : 0));
-    return addresses.isEmpty ? null : addresses.first.address;
+    int priority(NetworkInterface interface) {
+      final name = interface.name.toLowerCase();
+      if (RegExp(r'^(tun|tap|ppp|wg|rmnet|ccmni|pdp|utun)').hasMatch(name)) return 3;
+      if (RegExp(r'^(wlan|wifi|ap|swlan|softap|eth|en|bridge|br)').hasMatch(name)) return 0;
+      return 1;
+    }
+    interfaces.sort((a, b) => priority(a).compareTo(priority(b)));
+    final addresses = <String>[];
+    for (final interface in interfaces) {
+      final values = interface.addresses.where((address) => !address.isLoopback && address.address != '0.0.0.0').toList();
+      values.sort((a, b) => (_isPrivateIpv4(b) ? 1 : 0).compareTo(_isPrivateIpv4(a) ? 1 : 0));
+      addresses.addAll(values.map((address) => address.address));
+    }
+    return addresses.toSet().toList();
   }
 }
 
@@ -603,7 +714,7 @@ class _GameHomeState extends State<GameHome> {
                                 await game.startDiscovery();
                                 Future.delayed(const Duration(seconds: 7), () { if (mounted) setState(() => scanning = false); });
                               }, secondary: 'Aynı Wi-Fi veya telefon hotspotu'),
-                              if (game.discovered.isNotEmpty) ...game.discovered.entries.map((e) => Padding(padding: const EdgeInsets.only(top: 9), child: _button(e.key, Icons.wifi_rounded, gold, game.connecting ? null : () => game.join(e.value, _name), secondary: e.value))),
+                              if (game.discovered.isNotEmpty) ...game.discovered.entries.map((e) => Padding(padding: const EdgeInsets.only(top: 9), child: _button(e.key, Icons.wifi_rounded, gold, game.connecting ? null : () => game.joinRoom(e.key, _name), secondary: e.value))),
                               const SizedBox(height: 16),
                               Row(children: [Expanded(child: TextField(controller: ip, keyboardType: TextInputType.url, decoration: const InputDecoration(hintText: 'Oda IP adresi', prefixIcon: Icon(Icons.lan_outlined)))), const SizedBox(width: 8), IconButton.filled(onPressed: game.connecting ? null : () => game.join(ip.text, _name), icon: const Icon(Icons.arrow_forward_rounded), style: IconButton.styleFrom(backgroundColor: gold, foregroundColor: ink, minimumSize: const Size(54, 54)))]),
                               const SizedBox(height: 7),
@@ -719,14 +830,46 @@ class _GameRoomScreenState extends State<GameRoomScreen> {
 
   Widget _lobby() {
     final roster = players.values.toList()..sort((a,b) => (a['id'] == game.playerId ? -1 : 0));
+    final duration = (game.state['duration'] as num?)?.toInt() ?? 60;
     return SingleChildScrollView(key: const ValueKey('lobby'), padding: const EdgeInsets.all(22), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       const SizedBox(height: 8), _roomCodeCard(), const SizedBox(height: 24), const Text('Takım hazır mı?', style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900, letterSpacing: -.8)), const SizedBox(height: 6), Text('Oyuna başlamak için en az 2 oyuncu gerekli.', style: TextStyle(color: Colors.white.withValues(alpha: .57))), const SizedBox(height: 18),
       ...roster.map((p) => _playerTile(p)), const SizedBox(height: 12),
-      if (isHost) _button('Oyunu başlat', Icons.play_arrow_rounded, mint, roster.where((p)=>p['connected']==true).length >= 2 ? game.startRound : null, secondary: '5 tur • 60 saniye • adil çoğunluk'),
+      _durationPicker(duration), const SizedBox(height: 18),
+      if (isHost) _button('Oyunu başlat', Icons.play_arrow_rounded, mint, roster.where((p)=>p['connected']==true).length >= 2 ? game.startRound : null, secondary: '5 tur • $duration saniye • adil çoğunluk'),
       if (!isHost) _message('Oda sahibi oyunu başlattığında burada buluşacağız.', Icons.hourglass_top_rounded, lilac),
       const SizedBox(height: 20), _rulesCard(),
     ]));
   }
+
+  Widget _durationPicker(int duration) => _panel(
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text('TUR SÜRESİ', style: _eyebrow),
+        const SizedBox(height: 8),
+        Text(isHost ? 'Cevap yazmak için süreyi seç.' : 'Oda sahibinin seçtiği süre: $duration saniye', style: const TextStyle(fontSize: 13, color: Colors.white70)),
+        if (isHost) ...[
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [30, 60, 90, 120, 180, 300].map((seconds) => Semantics(
+              label: 'Tur süresi $seconds saniye',
+              child: ChoiceChip(
+                label: Text('$seconds sn'),
+                selected: duration == seconds,
+                onSelected: (_) => game.setRoundDuration(seconds),
+                selectedColor: mint,
+                checkmarkColor: ink,
+                labelStyle: TextStyle(color: duration == seconds ? ink : Colors.white, fontWeight: FontWeight.w700),
+                materialTapTargetSize: MaterialTapTargetSize.padded,
+              ),
+            )).toList(),
+          ),
+        ],
+      ],
+    ),
+  );
 
   Widget _answer() {
     final letter = game.state['letter'] as String? ?? 'A';
@@ -805,25 +948,44 @@ class _GameRoomScreenState extends State<GameRoomScreen> {
   Widget _review() {
     final myId = game.playerId;
     final current = game.state['votes'] as Map? ?? {};
-    return ListView(key: const ValueKey('review'), padding: const EdgeInsets.fromLTRB(22, 6, 22, 26), children: [
-      Row(children: [const Expanded(child: Text('Birlikte karar verin', style: TextStyle(fontSize: 25, fontWeight: FontWeight.w900, letterSpacing: -.7))), _timerBadge()]), const SizedBox(height: 6), Text('Yalnızca başkasının cevabına oy ver. Katı çoğunlukla kabul edilir.', style: TextStyle(color: Colors.white.withValues(alpha: .6), height: 1.4)), const SizedBox(height: 18),
-      for (final entry in players.entries) if (entry.key != myId) ...[
-        Text('${entry.value['name']}', style: TextStyle(color: lilac.withValues(alpha: .96), fontWeight: FontWeight.w800, fontSize: 13)), const SizedBox(height: 8),
-        for (var i = 0; i < questions.length; i++) if (((entry.value['answers'] as Map?)?['$i'] as String?)?.isNotEmpty == true)
-          Padding(padding: const EdgeInsets.only(bottom: 9), child: _voteCard(entry.key, i, (entry.value['answers'] as Map)['$i'] as String, current)),
+    final target = game.state['reviewTarget'] as String?;
+    final targetPlayer = players[target] as Map?;
+    final answers = targetPlayer?['answers'] as Map? ?? {};
+    final step = (game.state['reviewStep'] as num?)?.toInt() ?? 0;
+    final total = (game.state['reviewOrder'] as List?)?.length ?? players.length;
+    final isMyTurn = target == myId;
+    return ListView(
+      key: ValueKey('review-$step'),
+      padding: const EdgeInsets.fromLTRB(22, 6, 22, 26),
+      children: [
+        Row(children: [
+          const Expanded(child: Text('Birlikte karar verin', style: TextStyle(fontSize: 25, fontWeight: FontWeight.w900, letterSpacing: -.7))),
+          _timerBadge(),
+        ]),
+        const SizedBox(height: 12),
+        Text('OYUNCU ${step + 1} / $total', style: _eyebrow),
+        const SizedBox(height: 6),
+        Text('${targetPlayer?['name'] ?? 'Oyuncu'} cevapları', style: const TextStyle(color: lilac, fontWeight: FontWeight.w800, fontSize: 19)),
+        const SizedBox(height: 12),
+        if (isMyTurn) _message('Cevapların değerlendiriliyor. Diğer oyuncuların oylarını bekle.', Icons.hourglass_top_rounded, lilac)
+        else Text('Her cevaba oy ver. Herkes tamamlayınca sıradaki oyuncuya geçilir.', style: TextStyle(color: Colors.white.withValues(alpha: .6), height: 1.4)),
+        const SizedBox(height: 18),
+        for (var i = 0; i < questions.length; i++)
+          if ((answers['$i'] as String?)?.isNotEmpty == true && target != null)
+            Padding(padding: const EdgeInsets.only(bottom: 9), child: _voteCard(target, i, answers['$i'] as String, current, canVote: !isMyTurn)),
         const SizedBox(height: 10),
+        _message('Eşitlikte cevap reddedilir. Bu oyuncu için 35 saniye sonunda sıradakine geçilir; verilmeyen oylar kabul sayılmaz.', Icons.how_to_vote_rounded, gold),
       ],
-      _message('Eşitlikte cevap reddedilir. Süre dolunca oy vermeyenler kabul oyu sayılmaz.', Icons.how_to_vote_rounded, gold),
-    ]);
+    );
   }
 
-  Widget _voteCard(String target, int index, String answer, Map votes) {
+  Widget _voteCard(String target, int index, String answer, Map votes, {bool canVote = true}) {
     final key = '$target:$index';
     final ballot = votes[key] as Map? ?? {};
     final mine = ballot['mine'];
     return Container(padding: const EdgeInsets.all(14), decoration: BoxDecoration(color: panel, borderRadius: BorderRadius.circular(18), border: Border.all(color: Colors.white.withValues(alpha: .06))), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       Row(children: [Text(questions[index].toUpperCase(), style: _eyebrow), const Spacer(), Text('👍 ${ballot['yes'] ?? 0}   👎 ${ballot['no'] ?? 0}', style: const TextStyle(fontSize: 12))]), const SizedBox(height: 8), Text(answer, style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w800)), const SizedBox(height: 12),
-      Row(children: [Expanded(child: _voteButton('Kabul', Icons.check_rounded, mint, mine == true, () => game.vote(target, index, true))), const SizedBox(width: 8), Expanded(child: _voteButton('Ret', Icons.close_rounded, const Color(0xFFFF8793), mine == false, () => game.vote(target, index, false)))])
+      if (canVote) Row(children: [Expanded(child: _voteButton('Kabul', Icons.check_rounded, mint, mine == true, () => game.vote(target, index, true))), const SizedBox(width: 8), Expanded(child: _voteButton('Ret', Icons.close_rounded, const Color(0xFFFF8793), mine == false, () => game.vote(target, index, false)))])
     ]));
   }
 
@@ -847,16 +1009,37 @@ class _GameRoomScreenState extends State<GameRoomScreen> {
     return ListView(key: const ValueKey('finished'), padding: const EdgeInsets.all(24), children: [const SizedBox(height: 34), const Icon(Icons.emoji_events_rounded, color: gold, size: 72), const SizedBox(height: 14), const Text('Oyun bitti!', textAlign: TextAlign.center, style: TextStyle(fontWeight: FontWeight.w900, fontSize: 32)), const SizedBox(height: 22), for (var i=0; i<sorted.length; i++) _scoreTile(sorted[i], sorted[i]['score']), const SizedBox(height: 14), _message('Güzel oyundu. Yeni bir oda kurup tekrar oynayın.', Icons.favorite_rounded, mint)]);
   }
 
-  Widget _roomCodeCard() => Container(width: double.infinity, padding: const EdgeInsets.all(20), decoration: BoxDecoration(gradient: const LinearGradient(colors: [Color(0xFF244238), Color(0xFF253149)], begin: Alignment.topLeft, end: Alignment.bottomRight), borderRadius: BorderRadius.circular(24), border: Border.all(color: mint.withValues(alpha: .22))), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('KATILIM KODU', style: _eyebrow.copyWith(color: mint)), const SizedBox(height: 5), Row(children: [Expanded(child: Text('${game.state['room'] ?? '····'}', style: const TextStyle(fontSize: 38, fontWeight: FontWeight.w900, letterSpacing: 6))), IconButton(onPressed: () { Clipboard.setData(ClipboardData(text: game.localIp ?? '')); ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('IP adresi panoya kopyalandı'))); }, icon: const Icon(Icons.copy_rounded))]), Text('IP: ${game.localIp ?? 'bulunamadı'}  •  elle bağlanmak için', style: TextStyle(color: Colors.white.withValues(alpha: .66), fontSize: 12)), const SizedBox(height: 8), Text('Herkes aynı Wi-Fi veya bu telefonun hotspotuna bağlansın.', style: TextStyle(color: Colors.white.withValues(alpha: .62), fontSize: 12, height: 1.4))]));
+  Widget _roomCodeCard() {
+    final addresses = List<String>.from(game.state['hostAddresses'] as List? ?? game.localAddresses);
+    return Container(
+      width: double.infinity, padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(gradient: const LinearGradient(colors: [Color(0xFF244238), Color(0xFF253149)], begin: Alignment.topLeft, end: Alignment.bottomRight), borderRadius: BorderRadius.circular(24), border: Border.all(color: mint.withValues(alpha: .22))),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text('ODA ${game.state['room'] ?? '····'}', style: _eyebrow.copyWith(color: mint)),
+        const SizedBox(height: 12),
+        const Text('IP ile katıl', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+        for (final address in addresses) Row(children: [
+          Expanded(child: SelectableText(address, style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w700))),
+          IconButton(tooltip: 'IP adresini kopyala', onPressed: () {
+            Clipboard.setData(ClipboardData(text: address));
+            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('IP adresi panoya kopyalandı')));
+          }, icon: const Icon(Icons.copy_rounded)),
+        ]),
+        if (addresses.isEmpty) const Text('Wi-Fi veya hotspot bağlantısını kontrol edin.'),
+        const SizedBox(height: 8),
+        Text('Diğer telefonlarda bu IP adresini yazın. Birden fazla adres varsa sırayla deneyin. Herkes aynı Wi-Fi veya hotspot üzerinde olmalı.', style: TextStyle(color: Colors.white.withValues(alpha: .7), fontSize: 12, height: 1.4)),
+      ]),
+    );
+  }
 
   Widget _playerTile(Map p) => Container(margin: const EdgeInsets.only(bottom: 8), padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 13), decoration: BoxDecoration(color: panel, borderRadius: BorderRadius.circular(16)), child: Row(children: [CircleAvatar(radius: 18, backgroundColor: p['connected'] == true ? mint.withValues(alpha: .18) : Colors.white12, child: Icon(p['connected'] == true ? Icons.person_rounded : Icons.person_off_rounded, color: p['connected'] == true ? mint : Colors.white38, size: 19)), const SizedBox(width: 11), Expanded(child: Text('${p['name']}${p['id'] == game.playerId ? '  (sen)' : ''}', style: const TextStyle(fontWeight: FontWeight.w700))), Text(p['connected'] == true ? 'HAZIR' : 'YENİDEN BAĞLANIYOR', style: TextStyle(fontSize: 9, color: p['connected'] == true ? mint : gold, fontWeight: FontWeight.w900, letterSpacing: .5))]));
 
   Widget _scoreTile(Map p, int roundScore) => Container(margin: const EdgeInsets.only(bottom: 9), padding: const EdgeInsets.all(15), decoration: BoxDecoration(color: panel, borderRadius: BorderRadius.circular(18), border: Border.all(color: Colors.white.withValues(alpha: .05))), child: Row(children: [Text('${p['name']}', style: const TextStyle(fontWeight: FontWeight.w800)), const Spacer(), Text('+$roundScore', style: const TextStyle(color: mint, fontWeight: FontWeight.w700)), const SizedBox(width: 15), Text('${p['score']} puan', style: const TextStyle(color: gold, fontSize: 13, fontWeight: FontWeight.w800))]));
 
-  Widget _rulesCard() => Container(padding: const EdgeInsets.all(16), decoration: BoxDecoration(color: Colors.white.withValues(alpha: .035), borderRadius: BorderRadius.circular(18)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('NASIL OYNANIR', style: _eyebrow), const SizedBox(height: 9), _rule('01', '60 saniyede 6 kategoriye cevap yaz.'), _rule('02', 'Oyuncular birbirlerinin cevaplarını gizli oylar.'), _rule('03', 'Katı çoğunluk kabul eder; eşitlikte cevap reddedilir.'), _rule('04', 'Kabul edilen özgün cevap 10, tekrar cevap 5 puan.'), _rule('05', 'Bağlantı koparsa oyuncu 45 saniye odada tutulur.') ]));
+  Widget _rulesCard() => Container(padding: const EdgeInsets.all(16), decoration: BoxDecoration(color: Colors.white.withValues(alpha: .035), borderRadius: BorderRadius.circular(18)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('NASIL OYNANIR', style: _eyebrow), const SizedBox(height: 9), _rule('01', '${game.state['duration'] ?? 60} saniyede 6 kategoriye cevap yaz.'), _rule('02', 'Oyuncular birbirlerinin cevaplarını gizli oylar.'), _rule('03', 'Katı çoğunluk kabul eder; eşitlikte cevap reddedilir.'), _rule('04', 'Kabul edilen özgün cevap 10, tekrar cevap 5 puan.'), _rule('05', 'Bağlantı koparsa oyuncu 45 saniye odada tutulur.') ]));
   Widget _rule(String n, String text) => Padding(padding: const EdgeInsets.only(top: 7), child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(n, style: const TextStyle(color: mint, fontWeight: FontWeight.w800, fontSize: 11)), const SizedBox(width: 9), Expanded(child: Text(text, style: TextStyle(color: Colors.white.withValues(alpha: .7), fontSize: 12, height: 1.4)))]));
-  Widget _timerBadge() => Container(padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9), decoration: BoxDecoration(color: game.secondsLeft <= 10 ? const Color(0xFF593D29) : Colors.white.withValues(alpha: .07), borderRadius: BorderRadius.circular(14)), child: Row(children: [Icon(Icons.timer_outlined, size: 17, color: game.secondsLeft <= 10 ? gold : mint), const SizedBox(width: 6), Text('0:${game.secondsLeft.toString().padLeft(2, '0')}', style: TextStyle(color: game.secondsLeft <= 10 ? gold : Colors.white, fontWeight: FontWeight.w900, fontFeatures: const [FontFeature.tabularFigures()]))]));
-  Widget _statusChip() => Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7), decoration: BoxDecoration(color: game._socket?.readyState == WebSocket.open ? mint.withValues(alpha: .12) : gold.withValues(alpha: .12), borderRadius: BorderRadius.circular(20)), child: Row(children: [Icon(Icons.circle, size: 7, color: game._socket?.readyState == WebSocket.open ? mint : gold), const SizedBox(width: 6), Text(game._socket?.readyState == WebSocket.open ? 'BAĞLI' : 'BEKLENİYOR', style: const TextStyle(fontSize: 9, fontWeight: FontWeight.w900))]));
+  Widget _timerBadge() => Container(padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9), decoration: BoxDecoration(color: game.secondsLeft <= 10 ? const Color(0xFF593D29) : Colors.white.withValues(alpha: .07), borderRadius: BorderRadius.circular(14)), child: Row(children: [Icon(Icons.timer_outlined, size: 17, color: game.secondsLeft <= 10 ? gold : mint), const SizedBox(width: 6), Text('${game.secondsLeft ~/ 60}:${(game.secondsLeft % 60).toString().padLeft(2, '0')}', style: TextStyle(color: game.secondsLeft <= 10 ? gold : Colors.white, fontWeight: FontWeight.w900, fontFeatures: const [FontFeature.tabularFigures()]))]));
+  Widget _statusChip() => Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7), decoration: BoxDecoration(color: (game.hosting || game._socket?.readyState == WebSocket.open) ? mint.withValues(alpha: .12) : gold.withValues(alpha: .12), borderRadius: BorderRadius.circular(20)), child: Row(children: [Icon(Icons.circle, size: 7, color: (game.hosting || game._socket?.readyState == WebSocket.open) ? mint : gold), const SizedBox(width: 6), Text((game.hosting || game._socket?.readyState == WebSocket.open) ? 'BAĞLI' : 'BEKLENİYOR', style: const TextStyle(fontSize: 9, fontWeight: FontWeight.w900))]));
   Widget _voteButton(String label, IconData icon, Color color, bool selected, VoidCallback onTap) => OutlinedButton.icon(onPressed: onTap, icon: Icon(icon, size: 17), label: Text(label), style: OutlinedButton.styleFrom(foregroundColor: selected ? ink : color, backgroundColor: selected ? color : Colors.transparent, side: BorderSide(color: color.withValues(alpha: .4)), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(13)), padding: const EdgeInsets.symmetric(vertical: 12)));
 }
 

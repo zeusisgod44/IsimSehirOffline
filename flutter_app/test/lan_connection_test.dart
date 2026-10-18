@@ -199,6 +199,47 @@ void main() {
     );
   });
 
+  test('a copied host identity receives a guest identity without host powers',
+      () async {
+    final host = LanGameClient(
+      identity: 'host',
+      discoveryEnabled: false,
+      serverPort: 0,
+    );
+    final clients = <LanGameClient>[host];
+    addTearDown(() async {
+      for (final client in clients.reversed) {
+        await client.close();
+      }
+    });
+    await host.startHost('Asıl oda sahibi');
+    final guest = LanGameClient(
+      identity: 'host',
+      discoveryEnabled: false,
+      serverPort: host.roomPort,
+    );
+    clients.add(guest);
+
+    await guest.join('127.0.0.1', 'Kopyalanmış cihaz');
+
+    expect(guest.error, isNull);
+    expect(guest.playerId, isNot('host'));
+    expect(guest.playerId, isNotNull);
+    expect(host.playerId, 'host');
+    expect(playerIds(host), {'host', guest.playerId!});
+    expect((host.state['players'] as Map)['host']['name'], 'Asıl oda sahibi');
+    host.setRoundDuration(180);
+    await waitUntil(() => guest.state['duration'] == 180);
+    guest.setRoundDuration(30);
+    guest.startRound();
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    expect(host.phase, 'lobby');
+    expect(host.state['duration'], 180);
+    host.startRound();
+    await waitUntil(() => guest.phase == 'answer');
+    expect(guest.state['duration'], 180);
+  });
+
   test('a socket without a join reply times out instead of hanging', () async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final sockets = <WebSocket>[];

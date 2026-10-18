@@ -288,7 +288,7 @@ class LanGameClient extends ChangeNotifier {
         if (message['type'] == 'join') {
           if (id != null) return;
           var playerId = (message['id'] as String?) ?? const Uuid().v4();
-          if (_clients[playerId]?.readyState == WebSocket.open) {
+          if (playerId == _hostId || _clients[playerId]?.readyState == WebSocket.open) {
             playerId = const Uuid().v4();
           }
           id = playerId;

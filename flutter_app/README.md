@@ -1,6 +1,6 @@
 # İsim Şehir — çevrimdışı takım oyunu
 
-Android ve iOS için Flutter ile hazırlanmış, sunucusuz yerel ağ oyunu. Oda sahibi olan telefon küçük bir WebSocket sunucusu çalıştırır. Odadaki başka telefona veya buluta bağlantı kurulmaz; oyun internet olmadan aynı Wi‑Fi ya da kişisel erişim noktası üzerinden oynanır.
+Android için Flutter ile hazırlanmış, sunucusuz yerel ağ oyunu. Oda sahibi olan telefon küçük bir WebSocket sunucusu çalıştırır. Odadaki başka telefona veya buluta bağlantı kurulmaz; oyun internet olmadan aynı Wi‑Fi ya da kişisel erişim noktası üzerinden oynanır.
 
 ## Oynama
 
@@ -14,9 +14,7 @@ Oda sahibi telefonu oyunun yetkili kaynağıdır. Süre, tur geçişleri ve puan
 
 ## Geliştirme
 
-Gerekli araçlar: Flutter 3.47.5 veya üzeri (Dart 3.8+), Android için Android SDK ve JDK 17+, iOS derlemesi/imzası için macOS ve Xcode.
-
-GitHub Actions çıktısı `isim-sehir-flutter-android-ios-projects` dosyası, Flutter tarafından üretilmiş tam `android/` ve `ios/` dizinlerini içerir. İmzalı iOS uygulaması hazırlamak için bu dizinleri `flutter_app/` içine koyup macOS'ta Xcode ile açın.
+Gerekli araçlar: Flutter 3.47.5 veya üzeri (Dart 3.8+), Android SDK ve JDK 17+.
 
 ```sh
 flutter pub get
@@ -34,13 +32,8 @@ flutter build appbundle --release
 
 İmzalı dağıtım için kendi Android upload keystore'unuzu oluşturun ve `android/key.properties.example` yönergesini izleyerek gizli değerleri yalnızca yerel `android/key.properties` dosyasında tutun. Bu örnek proje imza anahtarı içermez.
 
-## iOS kurulum ve imzalama
-
-`ios/Runner.xcworkspace` dosyasını macOS'ta Xcode ile açın, Runner için Apple Developer Team ve Bundle Identifier seçin, ardından **Product → Archive** kullanın veya `flutter build ipa --release` çalıştırın. iOS uygulamasının cihaza yüklenebilir/dağıtılabilir IPA olması Apple geliştirici imzası gerektirir; App Store veya TestFlight dağıtımında Apple hesabı ve ilgili sertifika/provisioning profili gerekir. Bu Windows çalışma ortamında Xcode çalışmadığı için iOS derlemesi ya da imzalı IPA üretilemez.
-
 ## Yerel ağ izinleri
 
-- iOS'ta ilk Bonjour taramasında Yerel Ağ izni verilmeli. Bu izin, `Runner/Info.plist` içine eklenen `_isimsehir._tcp` Bonjour hizmeti ve açıklamayla beyan edilir.
 - Android manifesti internet soketi (yalnızca LAN), ağ durumu ve Wi‑Fi multicast kilidi izinlerini taşır. Oyun verisi hiçbir uzak adrese gönderilmez.
 - Bazı misafir Wi‑Fi ağları veya otel/router ayarları cihazlar arası bağlantıyı kapatır. Bu durumda bir telefonda hotspot açıp diğerlerini ona bağlayın; yine çalışmazsa IP ile katılmayı deneyin.
 

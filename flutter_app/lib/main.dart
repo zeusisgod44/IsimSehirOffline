@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-import 'dart:ui' show FontFeature;
 
 import 'package:bonsoir/bonsoir.dart';
 import 'package:flutter/material.dart';
@@ -733,7 +732,7 @@ class _GameRoomScreenState extends State<GameRoomScreen> {
       for (final entry in players.entries) if (entry.key != myId) ...[
         Text('${entry.value['name']}', style: TextStyle(color: lilac.withValues(alpha: .96), fontWeight: FontWeight.w800, fontSize: 13)), const SizedBox(height: 8),
         for (var i = 0; i < questions.length; i++) if (((entry.value['answers'] as Map?)?['$i'] as String?)?.isNotEmpty == true)
-          Padding(padding: const EdgeInsets.only(bottom: 9), child: _voteCard(entry.key as String, i, (entry.value['answers'] as Map)['$i'] as String, current)),
+          Padding(padding: const EdgeInsets.only(bottom: 9), child: _voteCard(entry.key, i, (entry.value['answers'] as Map)['$i'] as String, current)),
         const SizedBox(height: 10),
       ],
       _message('Eşitlikte cevap reddedilir. Süre dolunca oy vermeyenler kabul oyu sayılmaz.', Icons.how_to_vote_rounded, gold),

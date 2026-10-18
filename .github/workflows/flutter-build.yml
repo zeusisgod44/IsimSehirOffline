@@ -20,12 +20,11 @@ jobs:
         with:
           channel: stable
           cache: true
-      - name: Generate Android and iOS platform projects
+      - name: Generate Android platform project
         run: |
-          flutter create --platforms=android,ios --org com.isimsehir --project-name isim_sehir --no-pub platformscaffold
+          flutter create --platforms=android --org com.isimsehir --project-name isim_sehir --no-pub platformscaffold
           cp -R platformscaffold/android flutter_app/android
-          cp -R platformscaffold/ios flutter_app/ios
-      - name: Set up Android LAN and iOS Bonjour permissions
+      - name: Set up Android LAN permissions
         shell: pwsh
         run: ./flutter_app/tool/configure-platforms.ps1
       - name: Resolve Flutter packages
@@ -40,15 +39,6 @@ jobs:
       - name: Build installable Android debug APK
         working-directory: flutter_app
         run: flutter build apk --debug
-      - name: Save generated native projects for iOS signing
-        uses: actions/upload-artifact@v4
-        with:
-          name: isim-sehir-flutter-android-ios-projects
-          path: |
-            flutter_app/android/
-            flutter_app/ios/
-          if-no-files-found: error
-          retention-days: 30
       - name: Save Android APK
         uses: actions/upload-artifact@v4
         with:

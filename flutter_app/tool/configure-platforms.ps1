@@ -20,21 +20,3 @@ if ($xml -notmatch 'usesCleartextTraffic') {
   $xml = $xml.Replace('<application ', '<application android:usesCleartextTraffic="true" ')
 }
 [System.IO.File]::WriteAllText($manifest, $xml, [System.Text.UTF8Encoding]::new($false))
-
-$plist = Join-Path $PSScriptRoot '..\ios\Runner\Info.plist'
-$plist = [System.IO.Path]::GetFullPath($plist)
-if (-not (Test-Path -LiteralPath $plist)) { throw "iOS Info.plist not found: $plist" }
-$xml = Get-Content -LiteralPath $plist -Raw
-if ($xml -notmatch 'NSLocalNetworkUsageDescription') {
-  $keys = @'
-    <key>NSLocalNetworkUsageDescription</key>
-    <string>Yakındaki İsim Şehir oyun odalarını bulmak ve yerel ağda oynamak için kullanılır.</string>
-    <key>NSBonjourServices</key>
-    <array>
-        <string>_isimsehir._tcp</string>
-    </array>
-'@
-  $closingIndex = $xml.LastIndexOf('</dict>')
-  $xml = $xml.Insert($closingIndex, "$keys`n")
-}
-[System.IO.File]::WriteAllText($plist, $xml, [System.Text.UTF8Encoding]::new($false))

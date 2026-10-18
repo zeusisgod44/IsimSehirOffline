@@ -1,0 +1,58 @@
+name: Flutter Android build
+
+on:
+  push:
+    branches: [feature/flutter-ios-lan-game]
+    paths:
+      - 'flutter_app/**'
+      - '.github/workflows/flutter-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Generate Android and iOS platform projects
+        run: |
+          flutter create --platforms=android,ios --org com.isimsehir --project-name isim_sehir --no-pub platformscaffold
+          cp -R platformscaffold/android flutter_app/android
+          cp -R platformscaffold/ios flutter_app/ios
+      - name: Set up Android LAN and iOS Bonjour permissions
+        shell: pwsh
+        run: ./flutter_app/tool/configure-platforms.ps1
+      - name: Resolve Flutter packages
+        working-directory: flutter_app
+        run: flutter pub get
+      - name: Analyze source
+        working-directory: flutter_app
+        run: flutter analyze
+      - name: Run game rules tests
+        working-directory: flutter_app
+        run: flutter test
+      - name: Build installable Android debug APK
+        working-directory: flutter_app
+        run: flutter build apk --debug
+      - name: Save generated native projects for iOS signing
+        uses: actions/upload-artifact@v4
+        with:
+          name: isim-sehir-flutter-android-ios-projects
+          path: |
+            flutter_app/android/
+            flutter_app/ios/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Save Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: isim-sehir-android-apk
+          path: flutter_app/build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30

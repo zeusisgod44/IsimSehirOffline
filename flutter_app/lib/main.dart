@@ -117,15 +117,15 @@ class LanGameClient extends ChangeNotifier {
     await _discovery!.initialize();
     _discoveryEvents = _discovery!.eventStream!.listen((event) {
       if (event is BonsoirDiscoveryServiceFoundEvent) {
-        event.service?.resolve(_discovery!.serviceResolver);
+        event.service.resolve(_discovery!.serviceResolver);
       } else if (event is BonsoirDiscoveryServiceResolvedEvent) {
         final service = event.service;
-        if (service != null && service.hostAddresses.isNotEmpty) {
+        if (service.hostAddresses.isNotEmpty) {
           discovered[service.name] = service.hostAddresses.firstWhere((address) => InternetAddress.tryParse(address)?.type == InternetAddressType.IPv4, orElse: () => service.hostAddresses.first);
           notifyListeners();
         }
       } else if (event is BonsoirDiscoveryServiceLostEvent) {
-        discovered.remove(event.service?.name);
+        discovered.remove(event.service.name);
         notifyListeners();
       }
     });
@@ -180,9 +180,10 @@ class LanGameClient extends ChangeNotifier {
       try {
         final message = jsonDecode(raw as String) as Map<String, dynamic>;
         if (message['type'] == 'join') {
-          id = (message['id'] as String?) ?? const Uuid().v4();
+          final playerId = (message['id'] as String?) ?? const Uuid().v4();
+          id = playerId;
           final players = Map<String, dynamic>.from(state['players'] as Map);
-          if (!players.containsKey(id)) {
+          if (!players.containsKey(playerId)) {
             if (phase != 'lobby') {
               socket.add(jsonEncode({'type': 'error', 'message': 'Tur başladıktan sonra yeni oyuncu alınmaz. Yeniden katılma yalnızca aynı cihazla mümkündür.'}));
               socket.close();
@@ -194,11 +195,11 @@ class LanGameClient extends ChangeNotifier {
               return;
             }
           }
-          final previous = Map<String, dynamic>.from(players[id] as Map? ?? {});
-          players[id] = {...previous, 'id': id, 'name': _cleanName(message['name'] as String? ?? 'Oyuncu'), 'connected': true, 'answers': previous['answers'] ?? <String, String>{}, 'score': previous['score'] ?? 0};
+          final previous = Map<String, dynamic>.from(players[playerId] as Map? ?? {});
+          players[playerId] = {...previous, 'id': playerId, 'name': _cleanName(message['name'] as String? ?? 'Oyuncu'), 'connected': true, 'answers': previous['answers'] ?? <String, String>{}, 'score': previous['score'] ?? 0};
           state['players'] = players;
-          _clients[id!] = socket;
-          _hostId ??= id;
+          _clients[playerId] = socket;
+          _hostId ??= playerId;
           _sendState(socket);
           if (phase == 'answer' && (players.values).where((p) => (p as Map)['connected'] == true).every((p) => (p as Map)['submitted'] == true)) _beginReview();
           _broadcastState();
@@ -365,7 +366,7 @@ class LanGameClient extends ChangeNotifier {
       final old = Map<String, dynamic>.from(entry.value as Map);
       old['score'] = ((old['score'] as num?)?.toInt() ?? 0) + score;
       players[entry.key] = old;
-      roundScores[entry.key as String] = score;
+      roundScores[entry.key] = score;
     }
     state['players'] = players;
     state['roundResults'] = {'scores': roundScores, 'accepted': accepted};
@@ -488,32 +489,65 @@ class _GameHomeState extends State<GameHome> {
   void dispose() { game.removeListener(_update); name.dispose(); ip.dispose(); game.close(); super.dispose(); }
 
   @override
-  Widget build(BuildContext context) => Scaffold(body: Stack(children: [
-        Positioned(top: -100, right: -80, child: _glow(mint.withOpacity(.17), 260)),
-        SafeArea(child: Center(child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 560), child: ListenableBuilder(listenable: game, builder: (context, _) => SingleChildScrollView(padding: const EdgeInsets.fromLTRB(24, 20, 24, 34), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(children: [const Icon(Icons.wifi_tethering_rounded, color: mint, size: 19), const SizedBox(width: 9), Text('İNTERNETSİZ • YEREL AĞ', style: TextStyle(color: mint.withOpacity(.9), fontSize: 11, fontWeight: FontWeight.w800, letterSpacing: 1.4))]),
-          const SizedBox(height: 28),
-          const Text('İsim\nŞehir', style: TextStyle(fontSize: 54, height: .98, fontWeight: FontWeight.w900, letterSpacing: -2.5)),
-          const SizedBox(height: 16),
-          Text('Aynı ağa bağlanın, harf gelsin,\ncevapları birlikte karara bağlayın.', style: TextStyle(color: Colors.white.withOpacity(.66), fontSize: 16, height: 1.5)),
-          const SizedBox(height: 30),
-          _panel(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text('OYUNCU ADIN', style: _eyebrow), const SizedBox(height: 10),
-            TextField(controller: name, maxLength: 18, textCapitalization: TextCapitalization.words, decoration: const InputDecoration(hintText: 'Bir isim seç', prefixIcon: Icon(Icons.person_outline_rounded), counterText: '')),
-            const SizedBox(height: 22),
-            _button('Oda kur', Icons.add_circle_outline_rounded, mint, game.connecting ? null : () => game.startHost(_name), secondary: 'Bu telefon oda sahibi olur'),
-            const SizedBox(height: 12),
-            _button(scanning ? 'Odalar aranıyor…' : 'Yakındaki odaya katıl', Icons.radar_rounded, lilac, game.connecting ? null : () async { setState(() => scanning = true); await game.startDiscovery(); Future.delayed(const Duration(seconds: 7), () { if (mounted) setState(() => scanning = false); }); }, secondary: 'Aynı Wi-Fi veya telefon hotspotu'),
-            if (game.discovered.isNotEmpty) ...game.discovered.entries.map((e) => Padding(padding: const EdgeInsets.only(top: 9), child: _button(e.key, Icons.wifi_rounded, gold, () => game.join(e.value, _name), secondary: e.value))),
-            const SizedBox(height: 16),
-            Row(children: [Expanded(child: TextField(controller: ip, keyboardType: TextInputType.url, decoration: const InputDecoration(hintText: 'Oda IP adresi', prefixIcon: Icon(Icons.lan_outlined)))), const SizedBox(width: 8), IconButton.filled(onPressed: game.connecting ? null : () => game.join(ip.text, _name), icon: const Icon(Icons.arrow_forward_rounded), style: IconButton.styleFrom(backgroundColor: gold, foregroundColor: ink, minimumSize: const Size(54, 54)))]),
-            const SizedBox(height: 7), Text('IP adresiyle elle bağlan', style: TextStyle(color: Colors.white.withOpacity(.48), fontSize: 12)),
-          ])),
-          if (game.error != null) Padding(padding: const EdgeInsets.only(top: 16), child: _message(game.error!, Icons.info_outline_rounded, gold)),
-          const SizedBox(height: 22),
-          Row(children: [const Icon(Icons.phonelink_rounded, color: Colors.white54, size: 17), const SizedBox(width: 8), Text('Android ve iPhone • Sunucu telefonlardan biri', style: TextStyle(color: Colors.white.withOpacity(.48), fontSize: 12))]),
-        ]))))),
-      ]));
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Stack(
+        children: [
+          Positioned(top: -100, right: -80, child: _glow(mint.withValues(alpha: .17), 260)),
+          SafeArea(
+            child: Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 560),
+                child: ListenableBuilder(
+                  listenable: game,
+                  builder: (context, _) => SingleChildScrollView(
+                    padding: const EdgeInsets.fromLTRB(24, 20, 24, 34),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(children: [const Icon(Icons.wifi_tethering_rounded, color: mint, size: 19), const SizedBox(width: 9), Text('İNTERNETSİZ • YEREL AĞ', style: TextStyle(color: mint.withValues(alpha: .9), fontSize: 11, fontWeight: FontWeight.w800, letterSpacing: 1.4))]),
+                        const SizedBox(height: 28),
+                        const Text('İsim\nŞehir', style: TextStyle(fontSize: 54, height: .98, fontWeight: FontWeight.w900, letterSpacing: -2.5)),
+                        const SizedBox(height: 16),
+                        Text('Aynı ağa bağlanın, harf gelsin,\ncevapları birlikte karara bağlayın.', style: TextStyle(color: Colors.white.withValues(alpha: .66), fontSize: 16, height: 1.5)),
+                        const SizedBox(height: 30),
+                        _panel(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text('OYUNCU ADIN', style: _eyebrow),
+                              const SizedBox(height: 10),
+                              TextField(controller: name, maxLength: 18, textCapitalization: TextCapitalization.words, decoration: const InputDecoration(hintText: 'Bir isim seç', prefixIcon: Icon(Icons.person_outline_rounded), counterText: '')),
+                              const SizedBox(height: 22),
+                              _button('Oda kur', Icons.add_circle_outline_rounded, mint, game.connecting ? null : () => game.startHost(_name), secondary: 'Bu telefon oda sahibi olur'),
+                              const SizedBox(height: 12),
+                              _button(scanning ? 'Odalar aranıyor…' : 'Yakındaki odaya katıl', Icons.radar_rounded, lilac, game.connecting ? null : () async {
+                                setState(() => scanning = true);
+                                await game.startDiscovery();
+                                Future.delayed(const Duration(seconds: 7), () { if (mounted) setState(() => scanning = false); });
+                              }, secondary: 'Aynı Wi-Fi veya telefon hotspotu'),
+                              if (game.discovered.isNotEmpty) ...game.discovered.entries.map((e) => Padding(padding: const EdgeInsets.only(top: 9), child: _button(e.key, Icons.wifi_rounded, gold, () => game.join(e.value, _name), secondary: e.value))),
+                              const SizedBox(height: 16),
+                              Row(children: [Expanded(child: TextField(controller: ip, keyboardType: TextInputType.url, decoration: const InputDecoration(hintText: 'Oda IP adresi', prefixIcon: Icon(Icons.lan_outlined)))), const SizedBox(width: 8), IconButton.filled(onPressed: game.connecting ? null : () => game.join(ip.text, _name), icon: const Icon(Icons.arrow_forward_rounded), style: IconButton.styleFrom(backgroundColor: gold, foregroundColor: ink, minimumSize: const Size(54, 54)))]),
+                              const SizedBox(height: 7),
+                              Text('IP adresiyle elle bağlan', style: TextStyle(color: Colors.white.withValues(alpha: .48), fontSize: 12)),
+                            ],
+                          ),
+                        ),
+                        if (game.error != null) Padding(padding: const EdgeInsets.only(top: 16), child: _message(game.error!, Icons.info_outline_rounded, gold)),
+                        const SizedBox(height: 22),
+                        Row(children: [const Icon(Icons.phonelink_rounded, color: Colors.white54, size: 17), const SizedBox(width: 8), Text('Android ve iPhone • Sunucu telefonlardan biri', style: TextStyle(color: Colors.white.withValues(alpha: .48), fontSize: 12))]),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class GameRoomScreen extends StatefulWidget {
@@ -550,17 +584,66 @@ class _GameRoomScreenState extends State<GameRoomScreen> {
   bool get isHost => game.hosting && players[game.playerId] != null;
 
   @override
-  Widget build(BuildContext context) => PopScope(onPopInvokedWithResult: (didPop, result) { if (didPop) { widget.onExit(); game.close(); } }, child: Scaffold(body: SafeArea(child: Center(child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 600), child: Column(children: [
-        Padding(padding: const EdgeInsets.fromLTRB(18, 12, 18, 8), child: Row(children: [IconButton(onPressed: () => Navigator.pop(context), icon: const Icon(Icons.arrow_back_rounded)), const SizedBox(width: 6), Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(game.state['phase'] == 'lobby' ? 'OYUN ODASI' : 'TUR ${game.state['round'] ?? 1} / ${game.state['totalRounds'] ?? 5}', style: _eyebrow), Text('Oda ${game.state['room'] ?? '····'}', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800))])), _statusChip()])),
-        Expanded(child: AnimatedSwitcher(duration: const Duration(milliseconds: 320), child: switch (game.phase) {
-          'lobby' => _lobby(), 'answer' => _answer(), 'review' => _review(), 'results' => _results(), 'finished' => _finished(), _lobby(),
-        })),
-      ]))))));
+  Widget build(BuildContext context) {
+    return PopScope(
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) {
+          widget.onExit();
+          game.close();
+        }
+      },
+      child: Scaffold(
+        body: SafeArea(
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 600),
+              child: Column(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(18, 12, 18, 8),
+                    child: Row(
+                      children: [
+                        IconButton(onPressed: () => Navigator.pop(context), icon: const Icon(Icons.arrow_back_rounded)),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(game.state['phase'] == 'lobby' ? 'OYUN ODASI' : 'TUR ${game.state['round'] ?? 1} / ${game.state['totalRounds'] ?? 5}', style: _eyebrow),
+                              Text('Oda ${game.state['room'] ?? '····'}', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
+                            ],
+                          ),
+                        ),
+                        _statusChip(),
+                      ],
+                    ),
+                  ),
+                  Expanded(
+                    child: AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 320),
+                      child: switch (game.phase) {
+                        'lobby' => _lobby(),
+                        'answer' => _answer(),
+                        'review' => _review(),
+                        'results' => _results(),
+                        'finished' => _finished(),
+                        _ => _lobby(),
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 
   Widget _lobby() {
     final roster = players.values.toList()..sort((a,b) => (a['id'] == game.playerId ? -1 : 0));
     return SingleChildScrollView(key: const ValueKey('lobby'), padding: const EdgeInsets.all(22), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      const SizedBox(height: 8), _roomCodeCard(), const SizedBox(height: 24), const Text('Takım hazır mı?', style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900, letterSpacing: -.8)), const SizedBox(height: 6), Text('Oyuna başlamak için en az 2 oyuncu gerekli.', style: TextStyle(color: Colors.white.withOpacity(.57))), const SizedBox(height: 18),
+      const SizedBox(height: 8), _roomCodeCard(), const SizedBox(height: 24), const Text('Takım hazır mı?', style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900, letterSpacing: -.8)), const SizedBox(height: 6), Text('Oyuna başlamak için en az 2 oyuncu gerekli.', style: TextStyle(color: Colors.white.withValues(alpha: .57))), const SizedBox(height: 18),
       ...roster.map((p) => _playerTile(p)), const SizedBox(height: 12),
       if (isHost) _button('Oyunu başlat', Icons.play_arrow_rounded, mint, roster.where((p)=>p['connected']==true).length >= 2 ? game.startRound : null, secondary: '5 tur • 60 saniye • adil çoğunluk'),
       if (!isHost) _message('Oda sahibi oyunu başlattığında burada buluşacağız.', Icons.hourglass_top_rounded, lilac),
@@ -571,14 +654,73 @@ class _GameRoomScreenState extends State<GameRoomScreen> {
   Widget _answer() {
     final letter = game.state['letter'] as String? ?? 'A';
     final done = (players.values.where((p)=>p['submitted']==true).length);
-    return SingleChildScrollView(key: const ValueKey('answer'), padding: const EdgeInsets.fromLTRB(22, 4, 22, 26), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Row(children: [Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('HARFİNİZ', style: _eyebrow), const SizedBox(height: 4), Text(letter, style: const TextStyle(fontSize: 74, height: 1, fontWeight: FontWeight.w900, color: mint))])), _timerBadge()],),
-      const SizedBox(height: 8), LinearProgressIndicator(value: 1 - (game.secondsLeft / (game.state['duration'] as int? ?? 60)).clamp(0.0, 1.0), backgroundColor: Colors.white12, color: game.secondsLeft < 10 ? gold : mint, borderRadius: BorderRadius.circular(6), minHeight: 5),
-      const SizedBox(height: 14), Text('$done / ${players.length} kişi cevapladı', style: TextStyle(color: Colors.white.withOpacity(.6), fontSize: 12)), const SizedBox(height: 18),
-      ...List.generate(questions.length, (i) => Padding(padding: const EdgeInsets.only(bottom: 10), child: Row(children: [SizedBox(width: 94, child: Text(questions[i], style: const TextStyle(fontWeight: FontWeight.w700))), Expanded(child: TextField(controller: fields[i], enabled: !submitted, textCapitalization: TextCapitalization.words, maxLength: 35, inputFormatters: [FilteringTextInputFormatter.deny(RegExp(r'\n'))], decoration: InputDecoration(hintText: '$letter ile başlayan…', counterText: '', contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14)), onChanged: (_) => setState(() {})))])),
-      const SizedBox(height: 8), _button(submitted ? 'Cevapların gönderildi' : 'Cevapları gönder', submitted ? Icons.check_circle_outline_rounded : Icons.send_rounded, submitted ? lilac : mint, submitted ? null : _answersAreEntered ? _submit : null, secondary: 'Erken gönder, süre dolmadan düzenleyemezsin'),
-      const SizedBox(height: 8), _message('Boş bırakılan ya da harfle başlamayan cevaplar puan almaz.', Icons.lightbulb_outline_rounded, gold),
-    ]));
+    return SingleChildScrollView(
+      key: const ValueKey('answer'),
+      padding: const EdgeInsets.fromLTRB(22, 4, 22, 26),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('HARFİNİZ', style: _eyebrow),
+                    const SizedBox(height: 4),
+                    Text(letter, style: const TextStyle(fontSize: 74, height: 1, fontWeight: FontWeight.w900, color: mint)),
+                  ],
+                ),
+              ),
+              _timerBadge(),
+            ],
+          ),
+          const SizedBox(height: 8),
+          LinearProgressIndicator(
+            value: 1 - (game.secondsLeft / (game.state['duration'] as int? ?? 60)).clamp(0.0, 1.0),
+            backgroundColor: Colors.white12,
+            color: game.secondsLeft < 10 ? gold : mint,
+            borderRadius: BorderRadius.circular(6),
+            minHeight: 5,
+          ),
+          const SizedBox(height: 14),
+          Text('$done / ${players.length} kişi cevapladı', style: TextStyle(color: Colors.white.withValues(alpha: .6), fontSize: 12)),
+          const SizedBox(height: 18),
+          ...List.generate(
+            questions.length,
+            (i) => Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: Row(
+                children: [
+                  SizedBox(width: 94, child: Text(questions[i], style: const TextStyle(fontWeight: FontWeight.w700))),
+                  Expanded(
+                    child: TextField(
+                      controller: fields[i],
+                      enabled: !submitted,
+                      textCapitalization: TextCapitalization.words,
+                      maxLength: 35,
+                      inputFormatters: [FilteringTextInputFormatter.deny(RegExp(r'\n'))],
+                      decoration: InputDecoration(hintText: '$letter ile başlayan…', counterText: '', contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14)),
+                      onChanged: (_) => setState(() {}),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          _button(
+            submitted ? 'Cevapların gönderildi' : 'Cevapları gönder',
+            submitted ? Icons.check_circle_outline_rounded : Icons.send_rounded,
+            submitted ? lilac : mint,
+            submitted ? null : (_answersAreEntered ? _submit : null),
+            secondary: 'Erken gönder, süre dolmadan düzenleyemezsin',
+          ),
+          const SizedBox(height: 8),
+          _message('Boş bırakılan ya da harfle başlamayan cevaplar puan almaz.', Icons.lightbulb_outline_rounded, gold),
+        ],
+      ),
+    );
   }
   bool get _answersAreEntered => fields.any((f) => f.text.trim().isNotEmpty);
   void _submit() { final a = <int, String>{for (var i=0;i<fields.length;i++) i: fields[i].text.trim()}; game.submit(a); submitted = true; setState(() {}); }
@@ -587,9 +729,9 @@ class _GameRoomScreenState extends State<GameRoomScreen> {
     final myId = game.playerId;
     final current = game.state['votes'] as Map? ?? {};
     return ListView(key: const ValueKey('review'), padding: const EdgeInsets.fromLTRB(22, 6, 22, 26), children: [
-      Row(children: [const Expanded(child: Text('Birlikte karar verin', style: TextStyle(fontSize: 25, fontWeight: FontWeight.w900, letterSpacing: -.7))), _timerBadge()]), const SizedBox(height: 6), Text('Yalnızca başkasının cevabına oy ver. Katı çoğunlukla kabul edilir.', style: TextStyle(color: Colors.white.withOpacity(.6), height: 1.4)), const SizedBox(height: 18),
+      Row(children: [const Expanded(child: Text('Birlikte karar verin', style: TextStyle(fontSize: 25, fontWeight: FontWeight.w900, letterSpacing: -.7))), _timerBadge()]), const SizedBox(height: 6), Text('Yalnızca başkasının cevabına oy ver. Katı çoğunlukla kabul edilir.', style: TextStyle(color: Colors.white.withValues(alpha: .6), height: 1.4)), const SizedBox(height: 18),
       for (final entry in players.entries) if (entry.key != myId) ...[
-        Text('${entry.value['name']}', style: TextStyle(color: lilac.withOpacity(.96), fontWeight: FontWeight.w800, fontSize: 13)), const SizedBox(height: 8),
+        Text('${entry.value['name']}', style: TextStyle(color: lilac.withValues(alpha: .96), fontWeight: FontWeight.w800, fontSize: 13)), const SizedBox(height: 8),
         for (var i = 0; i < questions.length; i++) if (((entry.value['answers'] as Map?)?['$i'] as String?)?.isNotEmpty == true)
           Padding(padding: const EdgeInsets.only(bottom: 9), child: _voteCard(entry.key as String, i, (entry.value['answers'] as Map)['$i'] as String, current)),
         const SizedBox(height: 10),
@@ -602,7 +744,7 @@ class _GameRoomScreenState extends State<GameRoomScreen> {
     final key = '$target:$index';
     final ballot = votes[key] as Map? ?? {};
     final mine = ballot['mine'];
-    return Container(padding: const EdgeInsets.all(14), decoration: BoxDecoration(color: panel, borderRadius: BorderRadius.circular(18), border: Border.all(color: Colors.white.withOpacity(.06))), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+    return Container(padding: const EdgeInsets.all(14), decoration: BoxDecoration(color: panel, borderRadius: BorderRadius.circular(18), border: Border.all(color: Colors.white.withValues(alpha: .06))), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       Row(children: [Text(questions[index].toUpperCase(), style: _eyebrow), const Spacer(), Text('👍 ${ballot['yes'] ?? 0}   👎 ${ballot['no'] ?? 0}', style: const TextStyle(fontSize: 12))]), const SizedBox(height: 8), Text(answer, style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w800)), const SizedBox(height: 12),
       Row(children: [Expanded(child: _voteButton('Kabul', Icons.check_rounded, mint, mine == true, () => game.vote(target, index, true))), const SizedBox(width: 8), Expanded(child: _voteButton('Ret', Icons.close_rounded, const Color(0xFFFF8793), mine == false, () => game.vote(target, index, false)))])
     ]));
@@ -613,7 +755,7 @@ class _GameRoomScreenState extends State<GameRoomScreen> {
     final roundScores = (game.state['roundResults'] as Map?)?['scores'] as Map? ?? {};
     final approved = (game.state['roundResults'] as Map?)?['accepted'] as Map? ?? {};
     return ListView(key: const ValueKey('results'), padding: const EdgeInsets.all(22), children: [
-      const SizedBox(height: 8), const Text('Tur tamamlandı', style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900)), const SizedBox(height: 6), Text('${game.state['letter']} harfiyle oynanan tur puanları', style: TextStyle(color: Colors.white.withOpacity(.6))), const SizedBox(height: 18),
+      const SizedBox(height: 8), const Text('Tur tamamlandı', style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900)), const SizedBox(height: 6), Text('${game.state['letter']} harfiyle oynanan tur puanları', style: TextStyle(color: Colors.white.withValues(alpha: .6))), const SizedBox(height: 18),
       for (final p in playersSorted) _scoreTile(p, roundScores[p['id']] ?? 0),
       const SizedBox(height: 16), const Text('Cevaplara topluca bakış', style: TextStyle(fontWeight: FontWeight.w800)), const SizedBox(height: 8),
       for (final p in playersSorted) for (var i=0; i<questions.length; i++) if (((p['answers'] as Map?)?['$i'] as String?)?.isNotEmpty == true)
@@ -628,21 +770,21 @@ class _GameRoomScreenState extends State<GameRoomScreen> {
     return ListView(key: const ValueKey('finished'), padding: const EdgeInsets.all(24), children: [const SizedBox(height: 34), const Icon(Icons.emoji_events_rounded, color: gold, size: 72), const SizedBox(height: 14), const Text('Oyun bitti!', textAlign: TextAlign.center, style: TextStyle(fontWeight: FontWeight.w900, fontSize: 32)), const SizedBox(height: 22), for (var i=0; i<sorted.length; i++) _scoreTile(sorted[i], sorted[i]['score']), const SizedBox(height: 14), _message('Güzel oyundu. Yeni bir oda kurup tekrar oynayın.', Icons.favorite_rounded, mint)]);
   }
 
-  Widget _roomCodeCard() => Container(width: double.infinity, padding: const EdgeInsets.all(20), decoration: BoxDecoration(gradient: const LinearGradient(colors: [Color(0xFF244238), Color(0xFF253149)], begin: Alignment.topLeft, end: Alignment.bottomRight), borderRadius: BorderRadius.circular(24), border: Border.all(color: mint.withOpacity(.22))), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('KATILIM KODU', style: _eyebrow.copyWith(color: mint)), const SizedBox(height: 5), Row(children: [Expanded(child: Text('${game.state['room'] ?? '····'}', style: const TextStyle(fontSize: 38, fontWeight: FontWeight.w900, letterSpacing: 6))), IconButton(onPressed: () { Clipboard.setData(ClipboardData(text: game.localIp ?? '')); ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('IP adresi panoya kopyalandı'))); }, icon: const Icon(Icons.copy_rounded))]), Text('IP: ${game.localIp ?? 'bulunamadı'}  •  elle bağlanmak için', style: TextStyle(color: Colors.white.withOpacity(.66), fontSize: 12)), const SizedBox(height: 8), Text('Herkes aynı Wi-Fi veya bu telefonun hotspotuna bağlansın.', style: TextStyle(color: Colors.white.withOpacity(.62), fontSize: 12, height: 1.4))]));
+  Widget _roomCodeCard() => Container(width: double.infinity, padding: const EdgeInsets.all(20), decoration: BoxDecoration(gradient: const LinearGradient(colors: [Color(0xFF244238), Color(0xFF253149)], begin: Alignment.topLeft, end: Alignment.bottomRight), borderRadius: BorderRadius.circular(24), border: Border.all(color: mint.withValues(alpha: .22))), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('KATILIM KODU', style: _eyebrow.copyWith(color: mint)), const SizedBox(height: 5), Row(children: [Expanded(child: Text('${game.state['room'] ?? '····'}', style: const TextStyle(fontSize: 38, fontWeight: FontWeight.w900, letterSpacing: 6))), IconButton(onPressed: () { Clipboard.setData(ClipboardData(text: game.localIp ?? '')); ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('IP adresi panoya kopyalandı'))); }, icon: const Icon(Icons.copy_rounded))]), Text('IP: ${game.localIp ?? 'bulunamadı'}  •  elle bağlanmak için', style: TextStyle(color: Colors.white.withValues(alpha: .66), fontSize: 12)), const SizedBox(height: 8), Text('Herkes aynı Wi-Fi veya bu telefonun hotspotuna bağlansın.', style: TextStyle(color: Colors.white.withValues(alpha: .62), fontSize: 12, height: 1.4))]));
 
-  Widget _playerTile(Map p) => Container(margin: const EdgeInsets.only(bottom: 8), padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 13), decoration: BoxDecoration(color: panel, borderRadius: BorderRadius.circular(16)), child: Row(children: [CircleAvatar(radius: 18, backgroundColor: p['connected'] == true ? mint.withOpacity(.18) : Colors.white12, child: Icon(p['connected'] == true ? Icons.person_rounded : Icons.person_off_rounded, color: p['connected'] == true ? mint : Colors.white38, size: 19)), const SizedBox(width: 11), Expanded(child: Text('${p['name']}${p['id'] == game.playerId ? '  (sen)' : ''}', style: const TextStyle(fontWeight: FontWeight.w700))), Text(p['connected'] == true ? 'HAZIR' : 'YENİDEN BAĞLANIYOR', style: TextStyle(fontSize: 9, color: p['connected'] == true ? mint : gold, fontWeight: FontWeight.w900, letterSpacing: .5))]));
+  Widget _playerTile(Map p) => Container(margin: const EdgeInsets.only(bottom: 8), padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 13), decoration: BoxDecoration(color: panel, borderRadius: BorderRadius.circular(16)), child: Row(children: [CircleAvatar(radius: 18, backgroundColor: p['connected'] == true ? mint.withValues(alpha: .18) : Colors.white12, child: Icon(p['connected'] == true ? Icons.person_rounded : Icons.person_off_rounded, color: p['connected'] == true ? mint : Colors.white38, size: 19)), const SizedBox(width: 11), Expanded(child: Text('${p['name']}${p['id'] == game.playerId ? '  (sen)' : ''}', style: const TextStyle(fontWeight: FontWeight.w700))), Text(p['connected'] == true ? 'HAZIR' : 'YENİDEN BAĞLANIYOR', style: TextStyle(fontSize: 9, color: p['connected'] == true ? mint : gold, fontWeight: FontWeight.w900, letterSpacing: .5))]));
 
-  Widget _scoreTile(Map p, int roundScore) => Container(margin: const EdgeInsets.only(bottom: 9), padding: const EdgeInsets.all(15), decoration: BoxDecoration(color: panel, borderRadius: BorderRadius.circular(18), border: Border.all(color: Colors.white.withOpacity(.05))), child: Row(children: [Text('${p['name']}', style: const TextStyle(fontWeight: FontWeight.w800)), const Spacer(), Text('+$roundScore', style: const TextStyle(color: mint, fontWeight: FontWeight.w700)), const SizedBox(width: 15), Text('${p['score']} puan', style: const TextStyle(color: gold, fontSize: 13, fontWeight: FontWeight.w800))]));
+  Widget _scoreTile(Map p, int roundScore) => Container(margin: const EdgeInsets.only(bottom: 9), padding: const EdgeInsets.all(15), decoration: BoxDecoration(color: panel, borderRadius: BorderRadius.circular(18), border: Border.all(color: Colors.white.withValues(alpha: .05))), child: Row(children: [Text('${p['name']}', style: const TextStyle(fontWeight: FontWeight.w800)), const Spacer(), Text('+$roundScore', style: const TextStyle(color: mint, fontWeight: FontWeight.w700)), const SizedBox(width: 15), Text('${p['score']} puan', style: const TextStyle(color: gold, fontSize: 13, fontWeight: FontWeight.w800))]));
 
-  Widget _rulesCard() => Container(padding: const EdgeInsets.all(16), decoration: BoxDecoration(color: Colors.white.withOpacity(.035), borderRadius: BorderRadius.circular(18)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('NASIL OYNANIR', style: _eyebrow), const SizedBox(height: 9), _rule('01', '60 saniyede 6 kategoriye cevap yaz.'), _rule('02', 'Oyuncular birbirlerinin cevaplarını gizli oylar.'), _rule('03', 'Katı çoğunluk kabul eder; eşitlikte cevap reddedilir.'), _rule('04', 'Kabul edilen özgün cevap 10, tekrar cevap 5 puan.'), _rule('05', 'Bağlantı koparsa oyuncu 45 saniye odada tutulur.') ]));
-  Widget _rule(String n, String text) => Padding(padding: const EdgeInsets.only(top: 7), child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(n, style: const TextStyle(color: mint, fontWeight: FontWeight.w800, fontSize: 11)), const SizedBox(width: 9), Expanded(child: Text(text, style: TextStyle(color: Colors.white.withOpacity(.7), fontSize: 12, height: 1.4)))]));
-  Widget _timerBadge() => Container(padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9), decoration: BoxDecoration(color: game.secondsLeft <= 10 ? const Color(0xFF593D29) : Colors.white.withOpacity(.07), borderRadius: BorderRadius.circular(14)), child: Row(children: [Icon(Icons.timer_outlined, size: 17, color: game.secondsLeft <= 10 ? gold : mint), const SizedBox(width: 6), Text('0:${game.secondsLeft.toString().padLeft(2, '0')}', style: TextStyle(color: game.secondsLeft <= 10 ? gold : Colors.white, fontWeight: FontWeight.w900, fontFeatures: const [FontFeature.tabularFigures()]))]));
-  Widget _statusChip() => Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7), decoration: BoxDecoration(color: game._socket?.readyState == WebSocket.open ? mint.withOpacity(.12) : gold.withOpacity(.12), borderRadius: BorderRadius.circular(20)), child: Row(children: [Icon(Icons.circle, size: 7, color: game._socket?.readyState == WebSocket.open ? mint : gold), const SizedBox(width: 6), Text(game._socket?.readyState == WebSocket.open ? 'BAĞLI' : 'BEKLENİYOR', style: const TextStyle(fontSize: 9, fontWeight: FontWeight.w900))]));
-  Widget _voteButton(String label, IconData icon, Color color, bool selected, VoidCallback onTap) => OutlinedButton.icon(onPressed: onTap, icon: Icon(icon, size: 17), label: Text(label), style: OutlinedButton.styleFrom(foregroundColor: selected ? ink : color, backgroundColor: selected ? color : Colors.transparent, side: BorderSide(color: color.withOpacity(.4)), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(13)), padding: const EdgeInsets.symmetric(vertical: 12)));
+  Widget _rulesCard() => Container(padding: const EdgeInsets.all(16), decoration: BoxDecoration(color: Colors.white.withValues(alpha: .035), borderRadius: BorderRadius.circular(18)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('NASIL OYNANIR', style: _eyebrow), const SizedBox(height: 9), _rule('01', '60 saniyede 6 kategoriye cevap yaz.'), _rule('02', 'Oyuncular birbirlerinin cevaplarını gizli oylar.'), _rule('03', 'Katı çoğunluk kabul eder; eşitlikte cevap reddedilir.'), _rule('04', 'Kabul edilen özgün cevap 10, tekrar cevap 5 puan.'), _rule('05', 'Bağlantı koparsa oyuncu 45 saniye odada tutulur.') ]));
+  Widget _rule(String n, String text) => Padding(padding: const EdgeInsets.only(top: 7), child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(n, style: const TextStyle(color: mint, fontWeight: FontWeight.w800, fontSize: 11)), const SizedBox(width: 9), Expanded(child: Text(text, style: TextStyle(color: Colors.white.withValues(alpha: .7), fontSize: 12, height: 1.4)))]));
+  Widget _timerBadge() => Container(padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9), decoration: BoxDecoration(color: game.secondsLeft <= 10 ? const Color(0xFF593D29) : Colors.white.withValues(alpha: .07), borderRadius: BorderRadius.circular(14)), child: Row(children: [Icon(Icons.timer_outlined, size: 17, color: game.secondsLeft <= 10 ? gold : mint), const SizedBox(width: 6), Text('0:${game.secondsLeft.toString().padLeft(2, '0')}', style: TextStyle(color: game.secondsLeft <= 10 ? gold : Colors.white, fontWeight: FontWeight.w900, fontFeatures: const [FontFeature.tabularFigures()]))]));
+  Widget _statusChip() => Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7), decoration: BoxDecoration(color: game._socket?.readyState == WebSocket.open ? mint.withValues(alpha: .12) : gold.withValues(alpha: .12), borderRadius: BorderRadius.circular(20)), child: Row(children: [Icon(Icons.circle, size: 7, color: game._socket?.readyState == WebSocket.open ? mint : gold), const SizedBox(width: 6), Text(game._socket?.readyState == WebSocket.open ? 'BAĞLI' : 'BEKLENİYOR', style: const TextStyle(fontSize: 9, fontWeight: FontWeight.w900))]));
+  Widget _voteButton(String label, IconData icon, Color color, bool selected, VoidCallback onTap) => OutlinedButton.icon(onPressed: onTap, icon: Icon(icon, size: 17), label: Text(label), style: OutlinedButton.styleFrom(foregroundColor: selected ? ink : color, backgroundColor: selected ? color : Colors.transparent, side: BorderSide(color: color.withValues(alpha: .4)), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(13)), padding: const EdgeInsets.symmetric(vertical: 12)));
 }
 
 const _eyebrow = TextStyle(color: Colors.white54, fontSize: 10, fontWeight: FontWeight.w900, letterSpacing: 1.1);
-Widget _panel({required Widget child}) => Container(padding: const EdgeInsets.all(18), decoration: BoxDecoration(color: panel, borderRadius: BorderRadius.circular(26), border: Border.all(color: Colors.white.withOpacity(.06))), child: child);
-Widget _button(String title, IconData icon, Color color, VoidCallback? action, {String? secondary}) => SizedBox(width: double.infinity, child: FilledButton(onPressed: action, style: FilledButton.styleFrom(backgroundColor: color, foregroundColor: ink, disabledBackgroundColor: Colors.white10, disabledForegroundColor: Colors.white38, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(17)), padding: const EdgeInsets.fromLTRB(16, 12, 16, 12)), child: Row(children: [Icon(icon, size: 21), const SizedBox(width: 12), Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(title, style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 14)), if (secondary != null) Text(secondary, style: TextStyle(fontWeight: FontWeight.w500, fontSize: 10, color: ink.withOpacity(.66)))])), const Icon(Icons.chevron_right_rounded)])));
-Widget _message(String text, IconData icon, Color color) => Container(width: double.infinity, padding: const EdgeInsets.all(14), decoration: BoxDecoration(color: color.withOpacity(.08), borderRadius: BorderRadius.circular(16), border: Border.all(color: color.withOpacity(.18))), child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [Icon(icon, color: color, size: 18), const SizedBox(width: 9), Expanded(child: Text(text, style: TextStyle(color: Colors.white.withOpacity(.78), height: 1.4, fontSize: 12)))]));
+Widget _panel({required Widget child}) => Container(padding: const EdgeInsets.all(18), decoration: BoxDecoration(color: panel, borderRadius: BorderRadius.circular(26), border: Border.all(color: Colors.white.withValues(alpha: .06))), child: child);
+Widget _button(String title, IconData icon, Color color, VoidCallback? action, {String? secondary}) => SizedBox(width: double.infinity, child: FilledButton(onPressed: action, style: FilledButton.styleFrom(backgroundColor: color, foregroundColor: ink, disabledBackgroundColor: Colors.white10, disabledForegroundColor: Colors.white38, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(17)), padding: const EdgeInsets.fromLTRB(16, 12, 16, 12)), child: Row(children: [Icon(icon, size: 21), const SizedBox(width: 12), Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(title, style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 14)), if (secondary != null) Text(secondary, style: TextStyle(fontWeight: FontWeight.w500, fontSize: 10, color: ink.withValues(alpha: .66)))])), const Icon(Icons.chevron_right_rounded)])));
+Widget _message(String text, IconData icon, Color color) => Container(width: double.infinity, padding: const EdgeInsets.all(14), decoration: BoxDecoration(color: color.withValues(alpha: .08), borderRadius: BorderRadius.circular(16), border: Border.all(color: color.withValues(alpha: .18))), child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [Icon(icon, color: color, size: 18), const SizedBox(width: 9), Expanded(child: Text(text, style: TextStyle(color: Colors.white.withValues(alpha: .78), height: 1.4, fontSize: 12)))]));
 Widget _glow(Color color, double size) => IgnorePointer(child: Container(width: size, height: size, decoration: BoxDecoration(shape: BoxShape.circle, boxShadow: [BoxShadow(color: color, blurRadius: 90, spreadRadius: 20)])));

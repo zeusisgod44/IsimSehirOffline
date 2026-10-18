@@ -34,6 +34,7 @@ if ($xml -notmatch 'NSLocalNetworkUsageDescription') {
         <string>_isimsehir._tcp</string>
     </array>
 '@
-  $xml = $xml.Replace('</dict>', "$keys`n</dict>")
+  $closingIndex = $xml.LastIndexOf('</dict>')
+  $xml = $xml.Insert($closingIndex, "$keys`n")
 }
 [System.IO.File]::WriteAllText($plist, $xml, [System.Text.UTF8Encoding]::new($false))
